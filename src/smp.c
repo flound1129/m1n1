@@ -289,30 +289,30 @@ static bool smp_t6032_preflight(int node)
     return true;
 }
 
-static void smp_start_cpu(int index, const struct cpu_info *cpu)
+static bool smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
 
     if (index >= MAX_CPUS)
-        return;
+        return false;
 
     if (has_el3() && index >= MAX_EL3_CPUS)
-        return;
+        return false;
 
     if (spin_table[index].flag)
-        return;
+        return true;
 
     u32 system_mask, cluster_mask;
     if (!smp_cpu_start_masks(cpu->die, cpu->cluster, cpu->core, &system_mask, &cluster_mask)) {
         printf("Unsupported T6032 CPU-start metadata or topology!\n");
-        return;
+        return false;
     }
 
     if (!cpu_features->apple_sysregs_unlocked &&
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
         printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
-        return;
+        return false;
     }
 
     printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
@@ -357,6 +357,7 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
+    return true;
 }
 
 static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
@@ -590,12 +591,12 @@ int smp_init(void)
     return 0;
 }
 
-void smp_start_secondaries(void)
+int smp_start_secondaries(void)
 {
     printf("Starting secondary CPUs...\n");
 
     if (!smp_initialized)
-        return;
+        return chip_id == T6032 ? -1 : 0;
 
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
@@ -615,8 +616,15 @@ void smp_start_secondaries(void)
             continue;
         }
 
-        smp_start_cpu(i, cpu);
+        if (!smp_start_cpu(i, cpu) && chip_id == T6032)
+            return -1;
     }
+    if (chip_id == T6032) {
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (i != boot_cpu_idx && !spin_table[i].flag)
+                return -1;
+    }
+    return 0;
 }
 
 void smp_stop_secondaries(bool deep_sleep)

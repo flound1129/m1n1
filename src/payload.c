@@ -315,7 +315,8 @@ int payload_run(void)
 
     if (kernel && fdt) {
         cpufreq_init();
-        smp_start_secondaries();
+        if (smp_start_secondaries() < 0)
+            return -1;
         mitigations_perform();
         if (enable_tso) {
 

@@ -112,7 +112,7 @@ u64 hv_get_afsr1(void);
 void hv_set_elr(u64 val);
 
 /* HV main */
-void hv_init(void);
+int hv_init(void);
 void hv_start(void *entry, u64 regs[4]);
 void hv_start_secondary(int cpu, void *entry, u64 regs[4]);
 void hv_exit_cpu(int cpu);

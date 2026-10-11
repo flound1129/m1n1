@@ -346,7 +346,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         }
 
         case P_SMP_START_SECONDARIES:
-            smp_start_secondaries();
+            if (smp_start_secondaries() < 0)
+                reply->status = S_BADSTATE;
             break;
         case P_SMP_STOP_SECONDARIES:
             smp_stop_secondaries(request->args[0]);
@@ -491,7 +492,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_HV_INIT:
-            hv_init();
+            if (hv_init() < 0)
+                reply->status = S_BADSTATE;
             break;
         case P_HV_MAP:
             hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);

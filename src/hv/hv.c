@@ -123,7 +123,7 @@ static void hv_enable_sme_zt0(void)
     reg_set(SYS_SMCR_EL2, SMCR_EZT0);
 }
 
-void hv_init(void)
+int hv_init(void)
 {
     pcie_shutdown();
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
@@ -131,7 +131,8 @@ void hv_init(void)
         display_shutdown(DCP_QUIESCED);
     // reenable hpm interrupts for the guest for unused iodevs
     usb_hpm_restore_irqs(0);
-    smp_start_secondaries();
+    if (smp_start_secondaries() < 0)
+        return -1;
     smp_set_wfe_mode(true);
     hv_wdt_init();
 
@@ -177,6 +178,7 @@ void hv_init(void)
     sysop("tlbi alle1is");
     sysop("dsb ish");
     sysop("isb");
+    return 0;
 }
 
 static void hv_set_gxf_vbar(void)
