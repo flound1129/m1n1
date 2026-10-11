@@ -17,6 +17,7 @@
 
 static void *heap_base;
 static void *heap_limit;
+static void *heap_top;
 
 void heapblock_init(void)
 {
@@ -31,7 +32,11 @@ void heapblock_init(void)
 void heapblock_set_limit(void *limit)
 {
     heap_limit = limit;
-    printf("Heap limit: %p (%ld MiB)\n", limit, ((u8 *)limit - (u8 *)heap_base) >> 20);
+    if (heap_base && limit && (uintptr_t)limit >= (uintptr_t)heap_base)
+        printf("Heap limit: %p (%lu MiB)\n", limit,
+               ((uintptr_t)limit - (uintptr_t)heap_base) >> 20);
+    else
+        printf("Heap limit: %p\n", limit);
 }
 
 void *heapblock_get_cursor(void)
@@ -41,7 +46,20 @@ void *heapblock_get_cursor(void)
 
 void *heapblock_get_limit(void)
 {
+    if (heap_top && (!heap_limit || (uintptr_t)heap_top < (uintptr_t)heap_limit))
+        return heap_top;
     return heap_limit;
+}
+
+void heapblock_reserve_top(void *limit)
+{
+    if (!limit || (heap_base && (uintptr_t)limit < (uintptr_t)heap_base) ||
+        (heap_top && (uintptr_t)limit > (uintptr_t)heap_top))
+        panic("heapblock: invalid top reservation (cursor %p, top %p, new top %p)\n",
+              heap_base, heap_top, limit);
+
+    /* A requested/proxy heap limit cannot release live top reservations. */
+    heap_top = limit;
 }
 
 void *heapblock_alloc(size_t size)
@@ -51,15 +69,21 @@ void *heapblock_alloc(size_t size)
 
 void *heapblock_alloc_aligned(size_t size, size_t align)
 {
-    assert((align & (align - 1)) == 0);
+    assert(align && (align & (align - 1)) == 0);
     assert(heap_base);
 
-    uintptr_t block = (((uintptr_t)heap_base) + align - 1) & ~(align - 1);
+    uintptr_t aligned, end;
+    if (__builtin_add_overflow((uintptr_t)heap_base, align - 1, &aligned))
+        panic("heapblock: alignment overflow (%zu at %p)\n", align, heap_base);
+    uintptr_t block = aligned & ~(align - 1);
+    if (__builtin_add_overflow(block, size, &end))
+        panic("heapblock: allocation overflow (%zu bytes at 0x%lx)\n", size, block);
 
-    if (heap_limit && block + size > (uintptr_t)heap_limit)
-        panic("heapblock: out of memory (%zu bytes at 0x%lx, limit %p)\n", size, block, heap_limit);
+    void *limit = heapblock_get_limit();
+    if (limit && end > (uintptr_t)limit)
+        panic("heapblock: out of memory (%zu bytes at 0x%lx, limit %p)\n", size, block, limit);
 
-    heap_base = (void *)(block + size);
+    heap_base = (void *)end;
 
     return (void *)block;
 }

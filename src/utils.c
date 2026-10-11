@@ -5,6 +5,7 @@
 
 #include "utils.h"
 #include "cpu_regs.h"
+#include "heapblock.h"
 #include "iodev.h"
 #include "smp.h"
 #include "types.h"
@@ -206,18 +207,27 @@ bool supports_pan(void)
 u64 top_of_memory_alloc(size_t size)
 {
     static bool guard_page_inserted = false;
-    cur_boot_args.mem_size -= ALIGN_UP(size, SZ_16K);
-    u64 ret = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    u64 old_end, rounded, consumed, new_end, ret, allocation_end;
+    if (__builtin_add_overflow(cur_boot_args.phys_base, cur_boot_args.mem_size, &old_end) ||
+        __builtin_add_overflow((u64)size, (u64)SZ_16K - 1, &rounded))
+        panic("top_of_memory_alloc: address or size overflow\n");
 
-    if (!guard_page_inserted) {
-        cur_boot_args.mem_size -= SZ_16K;
-        guard_page_inserted = true;
-    } else {
-        // If the guard page was already there, move it down and allocate
-        // above it -- this is accomplished by simply shifting the allocated
-        // region by one page up.
-        ret += SZ_16K;
-    }
+    rounded &= ~((u64)SZ_16K - 1);
+    u64 guard_bytes = guard_page_inserted ? 0 : SZ_16K;
+    if (__builtin_add_overflow(rounded, guard_bytes, &consumed) ||
+        consumed > cur_boot_args.mem_size)
+        panic("top_of_memory_alloc: out of memory (%zu bytes)\n", size);
+
+    u64 new_size = cur_boot_args.mem_size - consumed;
+    if (__builtin_add_overflow(cur_boot_args.phys_base, new_size, &new_end) || !new_end ||
+        __builtin_add_overflow(new_end, (u64)SZ_16K, &ret) ||
+        __builtin_add_overflow(ret, rounded, &allocation_end))
+        panic("top_of_memory_alloc: reservation overflow\n");
+
+    /* Preserve the first/later placement and one movable 16-KiB guard page. */
+    heapblock_reserve_top((void *)(uintptr_t)new_end);
+    cur_boot_args.mem_size = new_size;
+    guard_page_inserted = true;
 
     return ret;
 }

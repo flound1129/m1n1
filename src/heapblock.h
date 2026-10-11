@@ -12,5 +12,7 @@ void *heapblock_alloc_aligned(size_t size, size_t align);
 void heapblock_set_limit(void *limit);
 void *heapblock_get_cursor(void);
 void *heapblock_get_limit(void);
+/* Publish a non-increasing ceiling for live top-down reservations. */
+void heapblock_reserve_top(void *limit);
 
 #endif
