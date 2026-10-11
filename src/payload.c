@@ -91,6 +91,41 @@ static bool prepare_decompression_buffer(void **dest, uint32_t *dest_len)
     return *dest_len != 0;
 }
 
+/* The handoff boundary is a declared upper bound, not an exact file length. */
+static bool prepare_compressed_source(void *source, size_t size, uint32_t *source_len)
+{
+    uintptr_t start = (uintptr_t)source, end;
+    if (!start || size > UINT32_MAX)
+        return false;
+
+    if (size) {
+        if (__builtin_add_overflow(start, size, &end))
+            return false;
+        *source_len = (uint32_t)size;
+        return true;
+    }
+
+    u64 image_end = cur_boot_args.top_of_kernel_data;
+    if (image_end > UINTPTR_MAX || start < (uintptr_t)_payload_start || start >= image_end)
+        return false;
+
+    u64 available = image_end - start;
+    *source_len = (uint32_t)(available < UINT32_MAX ? available : UINT32_MAX);
+    return *source_len != 0;
+}
+
+static bool compressed_spans_disjoint(void *source, uint32_t source_len, void *dest,
+                                     uint32_t dest_len)
+{
+    uintptr_t source_end, dest_end;
+    if (!source || !dest || !source_len || !dest_len ||
+        __builtin_add_overflow((uintptr_t)source, (uintptr_t)source_len, &source_end) ||
+        __builtin_add_overflow((uintptr_t)dest, (uintptr_t)dest_len, &dest_end))
+        return false;
+
+    return source_end <= (uintptr_t)dest || dest_end <= (uintptr_t)source;
+}
+
 static void finalize_uncompression(void *dest, size_t dest_len)
 {
     // Actually reserve the space. malloc is safe after this, but...
@@ -110,18 +145,23 @@ static void finalize_uncompression(void *dest, size_t dest_len)
 
 static void *decompress_gz(void *p, size_t size)
 {
-    unsigned int source_len = size, dest_len;
+    unsigned int source_len, dest_len;
+    if (!prepare_compressed_source(p, size, &source_len))
+        return NULL;
+    uint32_t source_cap = source_len;
 
     // Start at the end of the heap area, no allocation yet. The following code must not use
     // malloc or heapblock, until finalize_uncompression is called.
     void *dest;
     if (!prepare_decompression_buffer(&dest, &dest_len))
         return NULL;
+    if (!compressed_spans_disjoint(p, source_cap, dest, dest_len))
+        return NULL;
 
     printf("Uncompressing... ");
-    int ret = tinf_gzip_uncompress(dest, &dest_len, p, &source_len);
+    int ret = tinf_gzip_uncompress_prefix(dest, &dest_len, p, &source_len);
 
-    if (ret != TINF_OK) {
+    if (ret != TINF_OK || !source_len || source_len > source_cap) {
         printf("Error %d\n", ret);
         return NULL;
     }
@@ -135,18 +175,23 @@ static void *decompress_gz(void *p, size_t size)
 
 static void *decompress_xz(void *p, size_t size)
 {
-    uint32_t source_len = size, dest_len;
+    uint32_t source_len, dest_len;
+    if (!prepare_compressed_source(p, size, &source_len))
+        return NULL;
+    uint32_t source_cap = source_len;
 
     // Start at the end of the heap area, no allocation yet. The following code must not use
     // malloc or heapblock, until finalize_uncompression is called.
     void *dest;
     if (!prepare_decompression_buffer(&dest, &dest_len))
         return NULL;
+    if (!compressed_spans_disjoint(p, source_cap, dest, dest_len))
+        return NULL;
 
     printf("Uncompressing... ");
     int ret = XzDecode(p, &source_len, dest, &dest_len);
 
-    if (!ret) {
+    if (!ret || !source_len || source_len > source_cap) {
         printf("XZ decode failed\n");
         return NULL;
     }

@@ -555,12 +555,17 @@ void tinf_init(void)
 	return;
 }
 
-/* Inflate stream from source to dest */
-int tinf_uncompress(void *dest, unsigned int *destLen,
-                    const void *source, unsigned int *sourceLen)
+/* Inflate stream from source to dest.  In prefix mode, sourceLen is a
+ * nonzero capacity and is replaced by the bytes consumed; the historical
+ * entry point retains its exact-length check and zero-size sentinel. */
+static int tinf_uncompress_impl(void *dest, unsigned int *destLen,
+                                const void *source, unsigned int *sourceLen,
+                                int prefix)
 {
 	struct tinf_data d;
 	int bfinal;
+	if (prefix && (!sourceLen || !*sourceLen))
+		return TINF_DATA_ERROR;
 
 	/* Initialise data */
 	d.source = (const unsigned char *) source;
@@ -619,12 +624,28 @@ int tinf_uncompress(void *dest, unsigned int *destLen,
 		unsigned int slen = d.source - (const unsigned char *)source;
 		if (!*sourceLen)
 			*sourceLen = slen;
-		else if (*sourceLen != slen)
+		else if (!prefix && *sourceLen != slen)
 			return TINF_DATA_ERROR;
+		else if (prefix)
+			*sourceLen = slen;
 	}
 
 	*destLen = d.dest - d.dest_start;
 	return TINF_OK;
+}
+
+/* Historical exact-length/sentinel API. */
+int tinf_uncompress(void *dest, unsigned int *destLen,
+                    const void *source, unsigned int *sourceLen)
+{
+	return tinf_uncompress_impl(dest, destLen, source, sourceLen, 0);
+}
+
+/* Bounded prefix API: consume a stream at the beginning of a finite buffer. */
+int tinf_uncompress_prefix(void *dest, unsigned int *destLen,
+                           const void *source, unsigned int *sourceLen)
+{
+	return tinf_uncompress_impl(dest, destLen, source, sourceLen, 1);
 }
 
 /* clang -g -O1 -fsanitize=fuzzer,address -DTINF_FUZZING tinflate.c */

@@ -540,8 +540,7 @@ XzDecode (
         return false;
     }
 
-    if (!*InputSize)
-        *InputSize = BfTell();
 #endif
+    *InputSize = BfTell();
     return true;
 }

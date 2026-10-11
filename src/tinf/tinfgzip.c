@@ -49,8 +49,9 @@ static unsigned int read_le32(const unsigned char *p)
 	     | ((unsigned int) p[3] << 24);
 }
 
-int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
-                         const void *source, unsigned int *sourceLen)
+static int tinf_gzip_uncompress_impl(void *dest, unsigned int *destLen,
+                                     const void *source, unsigned int *sourceLen,
+                                     int prefix)
 {
 	const unsigned char *src = (const unsigned char *) source;
 	unsigned char *dst = (unsigned char *) dest;
@@ -59,6 +60,13 @@ int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
 	int res;
 	unsigned char flg;
 	unsigned int sourceDataLen = 0;
+	unsigned int sourceCap;
+	unsigned int headerLen;
+	unsigned int footerOffset;
+
+	if (prefix && (!sourceLen || !*sourceLen))
+		return TINF_DATA_ERROR;
+	sourceCap = sourceLen ? *sourceLen : 0;
 
 	/* -- Check header -- */
 
@@ -136,9 +144,9 @@ int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
 		start += 2;
 	}
 
-	/* -- Get decompressed length if available -- */
+	/* -- Get decompressed length if an exact source length is available -- */
 
-	if (*sourceLen) {
+	if (!prefix && *sourceLen) {
 		dlen = read_le32(&src[*sourceLen - 4]);
 
 		if (dlen > *destLen) {
@@ -148,32 +156,53 @@ int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
 
 	/* -- Check source length if available -- */
 
-	if (*sourceLen) {
+	if (!prefix && *sourceLen) {
 		if ((src + *sourceLen) - start < 8) {
 			return TINF_DATA_ERROR;
 		}
 		sourceDataLen = (src + *sourceLen) - start - 8;
+	} else if (prefix) {
+		headerLen = (unsigned int)(start - src);
+		if (headerLen > sourceCap || sourceCap - headerLen < 8)
+			return TINF_DATA_ERROR;
+		sourceDataLen = sourceCap - headerLen - 8;
 	}
 
 	/* -- Decompress data -- */
 
-	res = tinf_uncompress(dst, destLen, start, &sourceDataLen);
+	if (prefix)
+		res = tinf_uncompress_prefix(dst, destLen, start, &sourceDataLen);
+	else
+		res = tinf_uncompress(dst, destLen, start, &sourceDataLen);
 
 	if (res != TINF_OK) {
 		return TINF_DATA_ERROR;
 	}
 
-	sourceDataLen += (start - src) + 8;
+	if (prefix) {
+		headerLen = (unsigned int)(start - src);
+		if (sourceDataLen > sourceCap - headerLen - 8)
+			return TINF_DATA_ERROR;
+		footerOffset = headerLen + sourceDataLen;
+		if (footerOffset > sourceCap - 8)
+			return TINF_DATA_ERROR;
+		*sourceLen = footerOffset + 8;
+		dlen = read_le32(&src[footerOffset + 4]);
+		crc32 = read_le32(&src[footerOffset]);
+	} else {
+		sourceDataLen += (start - src) + 8;
 
-	if (*sourceLen && *sourceLen != sourceDataLen) {
-		return TINF_DATA_ERROR;
+		if (*sourceLen && *sourceLen != sourceDataLen) {
+			return TINF_DATA_ERROR;
+		}
+
+		*sourceLen = sourceDataLen;
+
+		/* -- Check decompressed length -- */
+
+		dlen = read_le32(&src[*sourceLen - 4]);
+		crc32 = read_le32(&src[*sourceLen - 8]);
 	}
-
-	*sourceLen = sourceDataLen;
-
-	/* -- Check decompressed length -- */
-
-	dlen = read_le32(&src[*sourceLen - 4]);
 
 	if (*destLen != dlen) {
 		return TINF_DATA_ERROR;
@@ -181,11 +210,24 @@ int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
 
 	/* -- Check CRC32 checksum -- */
 
-	crc32 = read_le32(&src[*sourceLen - 8]);
-
 	if (crc32 != tinf_crc32(dst, dlen)) {
 		return TINF_DATA_ERROR;
 	}
 
 	return TINF_OK;
+}
+
+/* Historical exact-length/sentinel API. */
+int tinf_gzip_uncompress(void *dest, unsigned int *destLen,
+                         const void *source, unsigned int *sourceLen)
+{
+	return tinf_gzip_uncompress_impl(dest, destLen, source, sourceLen, 0);
+}
+
+/* Bounded prefix API: consume one gzip member at the beginning of a finite
+ * buffer and return its actual total length, leaving any suffix untouched. */
+int tinf_gzip_uncompress_prefix(void *dest, unsigned int *destLen,
+                                const void *source, unsigned int *sourceLen)
+{
+	return tinf_gzip_uncompress_impl(dest, destLen, source, sourceLen, 1);
 }

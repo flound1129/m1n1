@@ -82,6 +82,16 @@ int TINFCC tinf_uncompress(void *dest, unsigned int *destLen,
                            const void *source, unsigned int *sourceLen);
 
 /**
+ * Decompress a deflate stream at the beginning of a finite source buffer.
+ *
+ * `sourceLen` must be non-NULL and nonzero on entry. It is a capacity on
+ * input and is replaced by the actual compressed bytes consumed on success;
+ * a shorter prefix is accepted, unlike tinf_uncompress().
+ */
+int TINFCC tinf_uncompress_prefix(void *dest, unsigned int *destLen,
+                                  const void *source, unsigned int *sourceLen);
+
+/**
  * Decompress `sourceLen` bytes of gzip data from `source` to `dest`.
  *
  * The variable `destLen` points to must contain the size of `dest` on entry,
@@ -98,6 +108,16 @@ int TINFCC tinf_uncompress(void *dest, unsigned int *destLen,
  */
 int TINFCC tinf_gzip_uncompress(void *dest, unsigned int *destLen,
                                 const void *source, unsigned int *sourceLen);
+
+/**
+ * Decompress one gzip member at the beginning of a finite source buffer.
+ *
+ * `sourceLen` must be non-NULL and nonzero on entry. It is a capacity on
+ * input and is replaced by the actual member length on success, leaving any
+ * suffix outside the member unconsumed.
+ */
+int TINFCC tinf_gzip_uncompress_prefix(void *dest, unsigned int *destLen,
+                                       const void *source, unsigned int *sourceLen);
 
 /**
  * Decompress `sourceLen` bytes of zlib data from `source` to `dest`.
