@@ -240,6 +240,9 @@ class HV(Reloadable):
         return written
 
     def trace_irq(self, device, num, count, flags):
+        if self.p.hv_trace_irq(self.AIC_EVT_TYPE_HW, num, count, flags) <= 0:
+            raise RuntimeError("Failed to configure AIC IRQ tracing")
+
         for n in range(num, num + count):
             if flags & self.IRQTRACE_IRQ:
                 self.interrupt_map[n] = device
@@ -252,8 +255,6 @@ class HV(Reloadable):
             self.add_tracer(zone, "AIC_IRQ", TraceMode.RESERVED)
         else:
             self.del_tracer(zone, "AIC_IRQ")
-
-        assert self.p.hv_trace_irq(self.AIC_EVT_TYPE_HW, num, count, flags) > 0
 
     def add_tracer(self, zone, ident, mode=TraceMode.ASYNC, read=None, write=None, **kwargs):
         assert mode in (TraceMode.RESERVED, TraceMode.OFF, TraceMode.BYPASS) or read or write
