@@ -45,6 +45,8 @@ CACHE_RANGE_OP(dc_civac_range, "dc civac")
 extern u8 _stack_top[];
 
 uint64_t ram_base = 0;
+/* An inherited SCTLR.M bit is not evidence of local T6032 carveout setup. */
+static bool t6032_mmu_initialized;
 
 static inline u64 read_sctlr(void)
 {
@@ -606,13 +608,17 @@ void mmu_init(void)
     printf("MMU: Initializing...\n");
 
     if (read_sctlr() & SCTLR_M) {
+        if (chip_id == T6032 && !t6032_mmu_initialized)
+            panic("T6032: inherited MMU state has not been validated!\n");
         printf("MMU: already initialized.\n");
         return;
     }
 
     /* Rebuilds are permitted only after the MMU-disabled check above. */
-    if (chip_id == T6032)
+    if (chip_id == T6032) {
+        t6032_mmu_initialized = false;
         mcc_t6032_begin_carveout_setup();
+    }
     mmu_init_pagetables();
     mmu_add_default_mappings();
     mmu_configure();
@@ -630,6 +636,8 @@ void mmu_init(void)
 
     printf("MMU: SCTLR_EL1: %lx -> %lx\n", mrs(SCTLR_EL1), sctlr);
     write_sctlr(sctlr);
+    if (chip_id == T6032)
+        t6032_mmu_initialized = true;
     printf("MMU: running with MMU and caches enabled!\n");
 }
 
