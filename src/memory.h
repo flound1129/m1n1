@@ -83,6 +83,7 @@ void mmu_map_framebuffer(u64 addr, size_t size);
 
 u64 mmu_disable(void);
 void mmu_restore(u64 state);
+bool mmu_smp_start_allowed(void);
 
 static inline bool mmu_active(void)
 {

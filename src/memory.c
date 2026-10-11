@@ -176,6 +176,116 @@ enum SPRR_val_t {
 #define MAIR_ATTR_DEVICE_GRE     0x0cUL
 
 static u64 *mmu_pt_L0;
+static bool mmu_smp_shared_ready_state;
+
+static bool mmu_smp_shared_range_end(u64 start, u64 size, u64 *end)
+{
+    if (start > (u64)-1 - size)
+        return false;
+    *end = start + size;
+    return true;
+}
+
+static bool mmu_smp_shared_va_range(u64 from, u64 size, u64 *normalized)
+{
+    const u64 va_limit = BIT(48);
+
+    /* The mapper indexes L0 directly: only lower-48-bit VAs are supported.
+     * TTBR1 shares the root, but its upper mirrors are not mapping API inputs. */
+    if (from >= va_limit || size > va_limit - from)
+        return false;
+    *normalized = from;
+    return true;
+}
+
+static bool mmu_smp_shared_bounds(u64 *base, u64 *size)
+{
+    extern u8 _smp_shared_start[], _smp_shared_end[];
+    u64 start = (u64)_smp_shared_start;
+    u64 end = (u64)_smp_shared_end;
+
+    if (end <= start || !mmu_smp_shared_range_end(start, end - start, &end))
+        return false;
+    *base = start;
+    *size = end - start;
+    return true;
+}
+
+static bool mmu_smp_shared_ranges_overlap(u64 first, u64 first_size, u64 second,
+                                          u64 second_size)
+{
+    u64 first_end, second_end;
+
+    if (!first_size || !second_size || !mmu_smp_shared_range_end(first, first_size, &first_end) ||
+        !mmu_smp_shared_range_end(second, second_size, &second_end))
+        return false;
+    return first < second_end && second < first_end;
+}
+
+static bool mmu_smp_shared_mapping_allowed(u64 from, u64 to, size_t size,
+                                            u8 attribute_index, u64 perms)
+{
+    static const u64 aliases[] = {0, REGION_RWX_EL0, REGION_RW_EL0, REGION_RX_EL1};
+    static const u64 alias_perms[] = {PERM_RW, PERM_RW_EL0, PERM_RW_EL0, PERM_RW_EL0};
+    const u64 valid_perms = PTE_AP_RO | PTE_AP_EL0 | PTE_PXN | PTE_UXN;
+    const u64 pa_limit = BIT(42);
+    u64 normalized_from, base, shared_size, from_end, ignored_end;
+    bool physical_overlap = false, canonical_overlap = false;
+
+    /* Initial default-map construction is intentionally broad. */
+    if (!mmu_smp_shared_ready_state || !size)
+        return true;
+    if (!mmu_smp_shared_bounds(&base, &shared_size) ||
+        !mmu_smp_shared_va_range(from, size, &normalized_from) ||
+        !mmu_smp_shared_range_end(normalized_from, size, &from_end) ||
+        !mmu_smp_shared_range_end(to, size, &ignored_end) ||
+        ((normalized_from | to | size) & (get_page_size() - 1)) || to >= pa_limit ||
+        size > pa_limit - to || attribute_index >= 8 || (perms & ~valid_perms))
+        return false;
+
+    /* No mapping may create a fifth alias of the shared physical interval. */
+    if (mmu_smp_shared_ranges_overlap(to, size, base, shared_size))
+        physical_overlap = true;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(aliases); i++) {
+        u64 alias = base | aliases[i], alias_end;
+        if (!mmu_smp_shared_range_end(alias, shared_size, &alias_end))
+            return false;
+        if (!mmu_smp_shared_ranges_overlap(normalized_from, size, alias, shared_size))
+            continue;
+        canonical_overlap = true;
+        if (normalized_from < alias || from_end > alias_end ||
+            to != base + (normalized_from - alias) ||
+            attribute_index != MAIR_IDX_DEVICE_nGnRnE || perms != alias_perms[i])
+            return false;
+    }
+
+    /* A non-canonical VA is valid only when its target is not shared RAM. */
+    return !physical_overlap || canonical_overlap;
+}
+
+static bool mmu_smp_shared_removal_allowed(u64 from, u64 to, size_t size, u8 attribute_index,
+                                            u64 perms)
+{
+    static const u64 aliases[] = {0, REGION_RWX_EL0, REGION_RW_EL0, REGION_RX_EL1};
+    u64 normalized_from, base, shared_size, ignored_end;
+
+    UNUSED(to);
+    UNUSED(attribute_index);
+    UNUSED(perms);
+    if (!mmu_smp_shared_ready_state || !size)
+        return true;
+    if (!mmu_smp_shared_bounds(&base, &shared_size) ||
+        !mmu_smp_shared_va_range(from, size, &normalized_from) ||
+        !mmu_smp_shared_range_end(normalized_from, size, &ignored_end) ||
+        ((from | size) & (get_page_size() - 1)))
+        return false;
+    UNUSED(ignored_end);
+    for (unsigned i = 0; i < ARRAY_SIZE(aliases); i++)
+        if (mmu_smp_shared_ranges_overlap(normalized_from, size, base | aliases[i], shared_size))
+            return false;
+    return true;
+}
 
 static u64 *mmu_pt_get_l1(u64 from)
 {
@@ -321,7 +431,7 @@ static bool mmu_t6032_mapping_allowed(u64 from, u64 to, u64 size)
     return mcc_t6032_range_allowed(to, size);
 }
 
-int mmu_map(u64 from, u64 to, u64 size)
+static int mmu_map(u64 from, u64 to, u64 size)
 {
     u64 chunk;
     /* Check the physical target, not descriptor attributes or the virtual alias. */
@@ -387,6 +497,7 @@ int mmu_map(u64 from, u64 to, u64 size)
 
 static void mmu_init_pagetables(void)
 {
+    mmu_smp_shared_ready_state = false;
     mmu_pt_L0 = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L0_TABLE);
     memset64(mmu_pt_L0, 0, sizeof(u64) * ENTRIES_PER_L0_TABLE);
     return;
@@ -394,6 +505,8 @@ static void mmu_init_pagetables(void)
 
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms)
 {
+    if (!mmu_smp_shared_mapping_allowed(from, to, size, attribute_index, perms))
+        panic("MMU: rejected SMP-shared mapping 0x%lx -> 0x%lx (0x%lx)\n", from, to, size);
     /* Validate raw physical addresses before descriptor bits can disguise them. */
     if (chip_id == T6032 && !mmu_t6032_mapping_allowed(from, to, size))
         panic("T6032: rejected MMU mapping 0x%lx -> 0x%lx (0x%lx)\n", from, to, size);
@@ -410,6 +523,8 @@ void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perm
 
 void mmu_rm_mapping(u64 from, size_t size)
 {
+    if (!mmu_smp_shared_removal_allowed(from, 0, size, 0, 0))
+        panic("MMU: rejected SMP-shared removal at 0x%lx (0x%lx)\n", from, size);
     if (mmu_map(from, 0, size) < 0)
         panic("Failed to rm MMU mapping at 0x%lx (0x%lx)\n", from, size);
 }
@@ -477,6 +592,8 @@ static void mmu_remap_ranges(void)
 
 void mmu_map_framebuffer(u64 addr, size_t size)
 {
+    if (!mmu_smp_shared_mapping_allowed(addr, addr, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0))
+        panic("MMU: rejected SMP-shared framebuffer mapping 0x%lx (0x%zx)\n", addr, size);
     if (chip_id == T6032 && !mmu_t6032_mapping_allowed(addr, addr, size))
         panic("T6032: rejected framebuffer mapping 0x%lx (0x%zx)\n", addr, size);
     printf("MMU: Adding Normal-NC mapping at 0x%lx (0x%zx) for framebuffer\n", addr, size);
@@ -499,6 +616,7 @@ static void mmu_remap_smp_shared(void)
     mmu_add_mapping(base | REGION_RWX_EL0, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
     mmu_add_mapping(base | REGION_RW_EL0, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
     mmu_add_mapping(base | REGION_RX_EL1, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
+    mmu_smp_shared_ready_state = true;
 }
 
 static void mmu_add_default_mappings(void)
@@ -716,4 +834,9 @@ u64 mmu_disable(void)
 void mmu_restore(u64 state)
 {
     write_sctlr(state);
+}
+
+bool mmu_smp_start_allowed(void)
+{
+    return !mmu_active() || mmu_smp_shared_ready_state;
 }

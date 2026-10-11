@@ -302,6 +302,11 @@ static bool smp_start_cpu(int index, const struct cpu_info *cpu)
     if (index < 0 || index >= MAX_CPUS)
         return false;
 
+    if (!mmu_smp_start_allowed()) {
+        printf("SMP: refusing CPU start without a validated shared mapping\n");
+        return false;
+    }
+
     if (has_el3() && index >= MAX_EL3_CPUS)
         return false;
 
@@ -603,6 +608,11 @@ int smp_init(void)
 int smp_start_secondaries(void)
 {
     printf("Starting secondary CPUs...\n");
+
+    if (!mmu_smp_start_allowed()) {
+        printf("SMP: refusing secondary start without a validated shared mapping\n");
+        return -1;
+    }
 
     if (!smp_initialized)
         return chip_id == T6032 ? -1 : 0;
