@@ -161,7 +161,8 @@ void m1n1_main(void)
         mcc_init();
     }
     mmu_init();
-    aic_init();
+    if (aic_init() < 0)
+        panic("AIC initialization failed!\n");
     smp_init();
 #endif
     wdt_disable();

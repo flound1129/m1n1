@@ -221,7 +221,7 @@ static int aic23_init(int version, int node)
     return 0;
 }
 
-void aic_init(void)
+int aic_init(void)
 {
     aic = NULL;
     aic_aperture = 0;
@@ -230,7 +230,7 @@ void aic_init(void)
 
     if (node < 0) {
         printf("AIC node not found!\n");
-        return;
+        return -1;
     }
 
     if (adt_is_compatible(adt, node, "aic,1")) {
@@ -241,26 +241,26 @@ void aic_init(void)
         aic = &aic3;
     } else {
         printf("AIC: Error: Unsupported version\n");
-        return;
+        return -1;
     }
 
     if (adt_get_reg(adt, path, "reg", 0, &aic->base, &aic_aperture)) {
         printf("Failed to get AIC reg property!\n");
         aic = NULL;
-        return;
+        return -1;
     }
     if (!aic->base || (aic->base & 3) || !aic_aperture ||
         aic_aperture > UINT64_MAX - aic->base) {
         printf("AIC: invalid register aperture\n");
         aic = NULL;
-        return;
+        return -1;
     }
 
     if (aic->version == 1) {
         if (!aic_range(0, AIC_REG_SIZE)) {
             printf("AIC: incomplete fixed register aperture\n");
             aic = NULL;
-            return;
+            return -1;
         }
         printf("AIC: Version 1 @ 0x%lx\n", aic->base);
         aic->nr_irq = FIELD_GET(AIC_INFO_NR_HW, read32(aic->base + AIC_INFO));
@@ -280,6 +280,7 @@ void aic_init(void)
         if (ret < 0)
             aic = NULL;
     }
+    return aic ? 0 : -1;
 }
 
 void aic_set_sw(int irq, bool active)
