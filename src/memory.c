@@ -305,9 +305,27 @@ static void mmu_pt_map_l3(u64 from, u64 to, u64 size)
     }
 }
 
+static bool mmu_t6032_mapping_allowed(u64 from, u64 to, u64 size)
+{
+    if (!size)
+        return true;
+    u64 page_size = get_page_size();
+    /* Match mmu_configure(): low-48-bit table indices and TCR_IPS_4TB. */
+    const u64 va_limit = BIT(48), pa_limit = BIT(42);
+    if ((page_size != 4096 && page_size != 16384) ||
+        ((from | to | size) & (page_size - 1)) || from >= va_limit || to >= pa_limit ||
+        size > va_limit - from || size > pa_limit - to)
+        return false;
+    return mcc_t6032_range_allowed(to, size);
+}
+
 int mmu_map(u64 from, u64 to, u64 size)
 {
     u64 chunk;
+    /* Check the physical target, not descriptor attributes or the virtual alias. */
+    if (chip_id == T6032 && (to & PTE_VALID) &&
+        !mmu_t6032_mapping_allowed(from, to & PTE_TARGET_MASK, size))
+        return -1;
     if (from & MASK(VADDR_L3_OFFSET_BITS) || size & MASK(VADDR_L3_OFFSET_BITS))
         return -1;
 
@@ -374,6 +392,9 @@ static void mmu_init_pagetables(void)
 
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms)
 {
+    /* Validate raw physical addresses before descriptor bits can disguise them. */
+    if (chip_id == T6032 && !mmu_t6032_mapping_allowed(from, to, size))
+        panic("T6032: rejected MMU mapping 0x%lx -> 0x%lx (0x%lx)\n", from, to, size);
     if (mmu_map(from,
                 to | PTE_MAIR_IDX(attribute_index) | PTE_ACCESS | PTE_VALID | PTE_SH_OS | perms,
                 size) < 0)
@@ -454,6 +475,8 @@ static void mmu_remap_ranges(void)
 
 void mmu_map_framebuffer(u64 addr, size_t size)
 {
+    if (chip_id == T6032 && !mmu_t6032_mapping_allowed(addr, addr, size))
+        panic("T6032: rejected framebuffer mapping 0x%lx (0x%zx)\n", addr, size);
     printf("MMU: Adding Normal-NC mapping at 0x%lx (0x%zx) for framebuffer\n", addr, size);
     dc_civac_range((void *)addr, size);
     mmu_add_mapping(addr, addr, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
@@ -587,6 +610,9 @@ void mmu_init(void)
         return;
     }
 
+    /* Rebuilds are permitted only after the MMU-disabled check above. */
+    if (chip_id == T6032)
+        mcc_t6032_begin_carveout_setup();
     mmu_init_pagetables();
     mmu_add_default_mappings();
     mmu_configure();

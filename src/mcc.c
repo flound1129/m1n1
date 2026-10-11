@@ -131,6 +131,34 @@ struct tz_regs t6031_tz_regs = {
 
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[PLANE_TZ_MAX_REGS + 1];
+static bool mcc_carveouts_ready;
+
+/* Only start a new setup phase with the MMU disabled and before building tables. */
+void mcc_t6032_begin_carveout_setup(void)
+{
+    mcc_carveouts_ready = false;
+    mcc_carveout_count = 0;
+    memset(mcc_carveouts, 0, sizeof(mcc_carveouts));
+}
+
+bool mcc_t6032_range_allowed(u64 base, u64 size)
+{
+    if (!mcc_carveouts_ready || !size)
+        return true;
+    u64 page_size = get_page_size();
+    if ((page_size != 4096 && page_size != 16384) || base > (u64)-1 - size ||
+        mcc_carveout_count > PLANE_TZ_MAX_REGS)
+        return false;
+    u64 end = base + size;
+    for (size_t i = 0; i < mcc_carveout_count; i++) {
+        u64 start = mcc_carveouts[i].base, length = mcc_carveouts[i].size;
+        if (!start || !length || start > (u64)-1 - length ||
+            ((start | length) & (page_size - 1)) ||
+            (base < start + length && start < end))
+            return false;
+    }
+    return true;
+}
 
 struct mcc_regs {
     u64 plane_base;
@@ -379,6 +407,9 @@ static bool mcc_t6032_decode_carveout(u32 first, u32 last, u64 page_size,
 
 int mcc_unmap_carveouts_t6032(u64 alias_size)
 {
+    /* Do not drop published protection outside an explicit MMU rebuild. */
+    if (mcc_carveouts_ready)
+        return -1;
     const u64 aliases[] = {0, REGION_RWX_EL0, REGION_RW_EL0, REGION_RX_EL1};
     struct mcc_carveout staged[PLANE_TZ_MAX_REGS + 1] = {0};
     u64 starts[PLANE_TZ_MAX_REGS * 4], ends[PLANE_TZ_MAX_REGS * 4];
@@ -449,6 +480,7 @@ int mcc_unmap_carveouts_t6032(u64 alias_size)
         mmu_rm_mapping(starts[i], ends[i] - starts[i]);
     memcpy(mcc_carveouts, staged, sizeof(staged));
     mcc_carveout_count = count;
+    mcc_carveouts_ready = true;
     return 0;
 }
 
