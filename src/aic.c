@@ -4,6 +4,7 @@
 #include "adt.h"
 #include "aic_regs.h"
 #include "assert.h"
+#include <string.h>
 #include "utils.h"
 
 #define MASK_REG(x) (4 * ((x) >> 5))
@@ -44,9 +45,20 @@ static struct aic aic3 = {
 
 struct aic *aic;
 
+static int aic_getprop_exact(int node, const char *name, void *out, size_t len)
+{
+    u32 actual_len = 0;
+    const void *raw = adt_getprop(adt, node, name, &actual_len);
+    if (!raw || actual_len != len)
+        return -1;
+    memcpy(out, raw, len);
+    return 1;
+}
+
 static int aic23_init(int version, int node)
 {
-    int ret = ADT_GETPROP(adt, node, "aic-iack-offset", &aic->regs.event);
+    int ret = aic_getprop_exact(node, "aic-iack-offset", &aic->regs.event,
+                                sizeof(aic->regs.event));
     if (ret < 0) {
         printf("AIC: failed to get property aic-iack-offset\n");
         return ret;
@@ -54,22 +66,31 @@ static int aic23_init(int version, int node)
 
     int32_t cap0_offset = aic->cap0_offset;
     if (cap0_offset == -1) {
-        ret = ADT_GETPROP(adt, node, "cap0-offset", &cap0_offset);
+        ret = aic_getprop_exact(node, "cap0-offset", &cap0_offset, sizeof(cap0_offset));
         if (ret < 0) {
             printf("AIC: failed to get property cap0-offset\n");
+            return ret;
         }
     }
-    u32 cap0 = read32(aic->base + cap0_offset);
-    aic->nr_die = FIELD_GET(AIC23_CAP0_LAST_DIE, cap0) + 1;
-    aic->nr_irq = FIELD_GET(AIC23_CAP0_NR_IRQ, cap0);
 
     int32_t maxnumirq_offset = aic->maxnumirq_offset;
     if (maxnumirq_offset == -1) {
-        ret = ADT_GETPROP(adt, node, "maxnumirq-offset", &maxnumirq_offset);
+        ret = aic_getprop_exact(node, "maxnumirq-offset", &maxnumirq_offset,
+                                sizeof(maxnumirq_offset));
         if (ret < 0) {
             printf("AIC: failed to get property maxnumirq-offset\n");
+            return ret;
         }
     }
+
+    if (cap0_offset < 0 || cap0_offset % 4 || maxnumirq_offset < 0 || maxnumirq_offset % 4) {
+        printf("AIC: invalid capability register offset\n");
+        return -1;
+    }
+
+    u32 cap0 = read32(aic->base + cap0_offset);
+    aic->nr_die = FIELD_GET(AIC23_CAP0_LAST_DIE, cap0) + 1;
+    aic->nr_irq = FIELD_GET(AIC23_CAP0_NR_IRQ, cap0);
 
     u32 info3 = read32(aic->base + maxnumirq_offset);
     aic->max_die = FIELD_GET(AIC23_MAXNUMIRQ_MAX_DIE, info3);
@@ -90,7 +111,7 @@ static int aic23_init(int version, int node)
      * AIC2, but fatal on AIC3.
      */
     u32 config_base;
-    if (ADT_GETPROP(adt, node, "extint-baseaddress", &config_base) > 0) {
+    if (aic_getprop_exact(node, "extint-baseaddress", &config_base, sizeof(config_base)) > 0) {
         aic->regs.config = config_base;
     }
 
@@ -112,11 +133,14 @@ static int aic23_init(int version, int node)
     off += sizeof(u32) * (aic->max_irq >> 5); /* HW_STATE */
 
     /* Fill in the strides dynamically if we can */
-    if (ADT_GETPROP(adt, node, "extintrcfg-stride", &aic->extintrcfg_stride) < 0)
+    if (aic_getprop_exact(node, "extintrcfg-stride", &aic->extintrcfg_stride,
+                         sizeof(aic->extintrcfg_stride)) < 0)
         aic->extintrcfg_stride = off - start_off;
-    if (ADT_GETPROP(adt, node, "intmaskset-stride", &aic->intmaskset_stride) < 0)
+    if (aic_getprop_exact(node, "intmaskset-stride", &aic->intmaskset_stride,
+                         sizeof(aic->intmaskset_stride)) < 0)
         aic->intmaskset_stride = off - start_off;
-    if (ADT_GETPROP(adt, node, "intmaskclear-stride", &aic->intmaskclear_stride) < 0)
+    if (aic_getprop_exact(node, "intmaskclear-stride", &aic->intmaskclear_stride,
+                         sizeof(aic->intmaskclear_stride)) < 0)
         aic->intmaskclear_stride = off - start_off;
 
     aic->regs.reg_size = aic->regs.event + 4;
@@ -131,13 +155,24 @@ static int aic23_init(int version, int node)
     const u8 *ext_intr_config = adt_getprop(adt, node, "aic-ext-intr-cfg", &ext_intr_config_len);
 
     if (ext_intr_config) {
+        if (ext_intr_config_len % 3) {
+            printf("AIC: malformed external interrupt configuration\n");
+            return -1;
+        }
+
         printf("AIC: Configuring %d external interrupts\n", ext_intr_config_len / 3);
         for (u32 i = 0; i < ext_intr_config_len; i += 3) {
             u8 die = ext_intr_config[i + 1] >> 4;
             u16 irq = ext_intr_config[i] | ((ext_intr_config[i + 1] & 0xf) << 8);
+            if (die >= aic->nr_die || irq >= aic->nr_irq) {
+                printf("AIC: external interrupt configuration out of range\n");
+                return -1;
+            }
+        }
+        for (u32 i = 0; i < ext_intr_config_len; i += 3) {
+            u8 die = ext_intr_config[i + 1] >> 4;
+            u16 irq = ext_intr_config[i] | ((ext_intr_config[i + 1] & 0xf) << 8);
             u8 target = ext_intr_config[i + 2];
-            assert(die < aic->nr_die);
-            assert(irq < aic->nr_irq);
             mask32(aic->base + aic->regs.config + die * aic->extintrcfg_stride + 4 * irq,
                    AIC23_IRQ_CFG_TARGET, FIELD_PREP(AIC23_IRQ_CFG_TARGET, target));
         }
