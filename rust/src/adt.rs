@@ -16,6 +16,7 @@ pub enum AdtError {
 
 const ADT_ALIGN: usize = 4;
 const ADT_MAX_DEPTH: usize = 8;
+const ADT_SIZE_MASK: u32 = 0x7fff_ffff;
 
 /// An ADT node consists of a header (the part described by the struct), packed
 /// key:value properties, and subnodes. Properties are always before subnodes
@@ -241,13 +242,13 @@ pub fn get_reg_container(
 
     let reg = node.named_prop(pname)?;
 
-    if reg.size == 0 {
+    if reg.payload_size() == 0 {
         return Err(AdtError::NotFound);
     }
 
     // Check that the reg property is big enough to contain a reg
     // container at index i.
-    if reg.size < (i as u32 + 1) * (addr_cells + size_cells) * 4 {
+    if reg.payload_size() < (i as u32 + 1) * (addr_cells + size_cells) * 4 {
         return Err(AdtError::BadValue);
     }
 
@@ -294,7 +295,7 @@ pub fn get_reg_container(
         }
 
         let entry_size = (4 * (paddr_cells + addr_cells + size_cells)) as usize;
-        let slice = unsafe { core::slice::from_raw_parts(ranges.value.as_ptr(), ranges.size as _) };
+        let slice = unsafe { core::slice::from_raw_parts(ranges.value.as_ptr(), ranges.payload_size() as _) };
 
         for range in slice.chunks_exact(entry_size) {
             let (ca_ref, remainder) = range.split_at(4 * addr_cells as usize);
@@ -463,7 +464,7 @@ impl ADTNode {
                 p.as_ptr()
                     .add(size_of::<[c_char; 32]>())
                     .add(size_of::<u32>())
-                    .add((p.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
+                    .add((p.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
                     as *const ADTNode,
             )
         }
@@ -550,6 +551,10 @@ impl ADTNode {
 }
 
 impl ADTProperty {
+    fn payload_size(&self) -> u32 {
+        self.size & ADT_SIZE_MASK
+    }
+
     /// Create a Rust fat pointer to the ADTProperty at ptr.
     ///
     /// We need to do this manually since we do not know the size of
@@ -558,11 +563,13 @@ impl ADTProperty {
         // SAFETY: This function is only ever called when we can guarantee that
         // ptr points to a valid ADTProperty.
         unsafe {
-            let sp: *const [u8] = core::slice::from_raw_parts(
-                ptr,
-                // Size of name, size of size, size of value
-                size_of::<[char; 32]>() + size_of::<u32>() + *(ptr.add(32)) as usize,
-            );
+            let size = (u32::from_le(core::ptr::read_unaligned(
+                ptr.add(32).cast::<u32>(),
+            )) & ADT_SIZE_MASK) as usize;
+            // A pointer to a struct with a slice tail carries the tail length,
+            // not the size of the header plus the tail. Bit 31 is a template
+            // marker in the ADT wire field and is excluded from the payload.
+            let sp: *const [u8] = core::ptr::slice_from_raw_parts(ptr, size);
 
             sp as *mut ADTProperty
         }
@@ -625,7 +632,7 @@ impl ADTProperty {
             self.as_ptr()
                 .add(size_of::<[c_char; 32]>())
                 .add(size_of::<u32>())
-                .add((self.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
+                .add((self.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
         };
         ADTProperty::from_ptr(ptr)
     }
@@ -636,7 +643,7 @@ impl ADTProperty {
             self.as_ptr()
                 .add(32)
                 .add(4)
-                .add((self.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
+                .add((self.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
         };
         ADTProperty::from_ptr_mut(ptr)
     }
@@ -660,12 +667,13 @@ impl ADTProperty {
 
     pub fn str_iter<'a>(&'a self) -> ADTPropertyStringIterator<'a> {
         ADTPropertyStringIterator {
-            value: unsafe { core::slice::from_raw_parts(self.value.as_ptr(), self.size as usize) },
+            value: unsafe { core::slice::from_raw_parts(self.value.as_ptr(), self.payload_size() as usize) },
         }
     }
 
     pub fn set(&mut self, val: &[u8]) -> Result<usize, AdtError> {
-        if val.len() != self.size as usize {
+        let size = self.payload_size() as usize;
+        if val.len() != size {
             return Err(AdtError::BadLength);
         }
 
@@ -673,27 +681,27 @@ impl ADTProperty {
             core::ptr::copy_nonoverlapping(
                 val.as_ptr(),
                 self.value.as_mut_ptr(),
-                self.size as usize,
+                size,
             );
         }
 
-        Ok(self.size as usize)
+        Ok(size)
     }
 
     /// Copy an ADTProperty's value to a preallocated buffer
     pub fn copy_raw(&self, ptr: usize) -> Result<usize, AdtError> {
-        // SAFETY: Callers are reponsible for allocating self.size bytes at ptr,
+        // SAFETY: Callers are reponsible for allocating self.payload_size() bytes at ptr,
         // and we never reach this code if we aren't already certain that we are
         // a valid property
         unsafe {
-            core::ptr::copy_nonoverlapping(self.value.as_ptr(), ptr as *mut u8, self.size as usize);
+            core::ptr::copy_nonoverlapping(self.value.as_ptr(), ptr as *mut u8, self.payload_size() as usize);
         }
 
-        Ok(self.size as usize)
+        Ok(self.payload_size() as usize)
     }
 
     pub fn u32(&self) -> Result<u32, AdtError> {
-        if self.size != 4 {
+        if self.payload_size() != 4 {
             return Err(AdtError::BadLength);
         }
 
@@ -701,7 +709,7 @@ impl ADTProperty {
     }
 
     pub fn u64(&self) -> Result<u64, AdtError> {
-        if self.size != 8 {
+        if self.payload_size() != 8 {
             return Err(AdtError::BadLength);
         }
 
@@ -750,7 +758,7 @@ pub unsafe extern "C" fn adt_next_property_offset(_dt: *const c_void, offset: c_
         p.as_ptr()
             .add(size_of::<[c_char; 32]>())
             .add(size_of::<u32>())
-            .add((p.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
+            .add((p.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
             .sub(adt as usize) as c_int
     }
 }
@@ -829,7 +837,7 @@ pub unsafe extern "C" fn adt_getprop(
     };
 
     if !lenp.is_null() {
-        unsafe { *lenp = p.size as u32 }
+        unsafe { *lenp = p.payload_size() }
     }
 
     p.value.as_ptr() as *const c_void
@@ -853,7 +861,7 @@ pub unsafe extern "C" fn adt_getprop_by_offset(
     }
 
     if !lenp.is_null() {
-        unsafe { *lenp = p.size as u32 }
+        unsafe { *lenp = p.payload_size() }
     }
 
     p.value.as_ptr() as *const c_void
@@ -965,7 +973,7 @@ pub unsafe extern "C" fn adt_getprop_copy(
         Err(e) => return e as c_int,
     };
 
-    if p.size as usize != len {
+    if p.payload_size() as usize != len {
         return AdtError::BadLength as c_int;
     }
     if len == 0 {
