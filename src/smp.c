@@ -198,6 +198,97 @@ static bool smp_cpu_start_masks(int die, int cluster, int core, u32 *system_mask
     return true;
 }
 
+static bool smp_t6032_u32(int node, const char *name, u32 *value)
+{
+    u32 length = 0;
+    const u8 *raw = adt_getprop(adt, node, name, &length);
+    if (!raw || length != 4)
+        return false;
+    *value = (u32)raw[0] | ((u32)raw[1] << 8) | ((u32)raw[2] << 16) |
+             ((u32)raw[3] << 24);
+    return true;
+}
+
+static bool smp_t6032_preflight(int node)
+{
+    u32 maximum, clusters;
+    if (MAX_CPUS < 32 || !smp_t6032_u32(node, "max_cpus", &maximum) || maximum != 32 ||
+        !smp_t6032_u32(node, "cpu-cluster-count", &clusters) || clusters != 3 ||
+        adt_get_child_count(adt, node) != 32)
+        return false;
+
+    u32 ids = 0, masks[2] = {0, 0};
+    u64 bases[32] = {0}, ends[32] = {0};
+    int nodes[MAX_CPUS] = {0};
+    struct cpu_info cpus[MAX_CPUS] = {0};
+    int running = -1;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 id, reg, die, cluster, core, system_mask, cluster_mask;
+        if (!smp_t6032_u32(node, "cpu-id", &id) || id >= 32 || (ids & (1U << id)) ||
+            !smp_t6032_u32(node, "reg", &reg) || (reg & ~0x7fffU) ||
+            !smp_t6032_u32(node, "die-id", &die) ||
+            !smp_t6032_u32(node, "die-cluster-id", &cluster) ||
+            !smp_t6032_u32(node, "cluster-core-id", &core))
+            return false;
+
+        if (die != FIELD_GET(CPU_REG_DIE, reg) ||
+            cluster != FIELD_GET(CPU_REG_CLUSTER, reg) ||
+            core != FIELD_GET(CPU_REG_CORE, reg) ||
+            !smp_cpu_start_masks(die, cluster, core, &system_mask, &cluster_mask))
+            return false;
+        if (masks[die] & system_mask)
+            return false;
+
+        u32 length = 0;
+        const u8 *state = adt_getprop(adt, node, "state", &length);
+        if (!state || length != 8)
+            return false;
+        if (!memcmp(state, "running", 8)) {
+            if (running != -1)
+                return false;
+            running = id;
+        } else if (memcmp(state, "waiting", 8)) {
+            return false;
+        }
+
+        const u8 *impl = adt_getprop(adt, node, "cpu-impl-reg", &length);
+        if (!impl || length != 16)
+            return false;
+        u64 base = 0, size = 0;
+        for (unsigned byte = 0; byte < 8; byte++) {
+            base |= (u64)impl[byte] << (8 * byte);
+            size |= (u64)impl[8 + byte] << (8 * byte);
+        }
+        /* Cover RVBAR and the stop/status access at +0x100; never map/read here. */
+        if (!base || (base & 7) || size < 0x108 || base > (u64)-1 - size)
+            return false;
+        u64 end = base + size;
+        for (unsigned previous = 0; previous < 32; previous++) {
+            if ((ids & (1U << previous)) && base < ends[previous] && bases[previous] < end)
+                return false;
+        }
+
+        ids |= 1U << id;
+        masks[die] |= system_mask;
+        bases[id] = base;
+        ends[id] = end;
+        nodes[id] = node;
+        cpus[id] = (struct cpu_info){
+            .valid = true, .die = die, .cluster = cluster, .core = core, .impl_reg = base,
+        };
+    }
+
+    if (ids != 0xffffffffU || masks[0] != 0xffff || masks[1] != 0xffff ||
+        running == -1 || (boot_cpu_idx != -1 && boot_cpu_idx != running))
+        return false;
+
+    /* Do not expose a partially validated cache on rejection. */
+    memcpy(cpu_nodes, nodes, sizeof(cpu_nodes));
+    memcpy(cpu_info, cpus, sizeof(cpu_info));
+    return true;
+}
+
 static void smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
@@ -354,6 +445,11 @@ int smp_init(void)
     memset(cpu_nodes, 0, sizeof(cpu_nodes));
     memset(cpu_info, 0, sizeof(cpu_info));
 
+    if (chip_id == T6032 && !smp_t6032_preflight(node)) {
+        printf("Invalid T6032 CPU inventory; no CPU startup attempted!\n");
+        return -1;
+    }
+
     switch (chip_id) {
         case S5L8960X:
         case T7000:
@@ -405,7 +501,9 @@ int smp_init(void)
             return -1;
     }
 
-    ADT_FOREACH_CHILD(adt, node)
+    /* T6032 caches were accepted together by the complete preflight. */
+    if (chip_id != T6032)
+        ADT_FOREACH_CHILD(adt, node)
     {
         u32 cpu_id;
 
@@ -456,7 +554,9 @@ int smp_init(void)
     smp_reset_stacks[boot_cpu_idx].mpidr = spin_table[boot_cpu_idx].mpidr;
     sysop("dsb sy");
 
-    for (int i = 0; i < MAX_CPUS; i++) {
+    /* Never use the legacy implementation-register fallback on T6032. */
+    if (chip_id != T6032)
+        for (int i = 0; i < MAX_CPUS; i++) {
         int cpu_node = cpu_nodes[i];
 
         if (!cpu_node)
