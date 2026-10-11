@@ -3,9 +3,11 @@
 #include "mcc.h"
 #include "adt.h"
 #include "hv.h"
+#include "heapblock.h"
 #include "memory.h"
 #include "string.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 static bool mcc_initialized = false;
 
@@ -338,8 +340,122 @@ int mcc_enable_cache(void)
     return ret;
 }
 
+/* Preserve OR addressing only when it is affine over the entire interval. */
+static bool mcc_t6032_or_range(u64 start, u64 end, u64 mask, u64 *mapped_start, u64 *mapped_end)
+{
+    if (start >= end)
+        return false;
+    if (mask) {
+        u64 lowest_bit = mask & (~mask + 1);
+        u64 block_mask = ~(lowest_bit - 1);
+        if ((start & block_mask) != ((end - 1) & block_mask))
+            return false;
+    }
+    u64 first = start | mask, last = end | mask;
+    if (first >= last || last - first != end - start)
+        return false;
+    *mapped_start = first;
+    *mapped_end = last;
+    return true;
+}
+
+static bool mcc_t6032_decode_carveout(u32 first, u32 last, u64 page_size,
+                                      struct mcc_carveout *out)
+{
+    u64 start, end;
+    if ((page_size != 4096 && page_size != 16384) || !first || last <= first ||
+        !ram_base || !mem_size_actual || ram_base > (u64)-1 - mem_size_actual)
+        return false;
+    u64 ram_end = ram_base + mem_size_actual;
+    if (((ram_base | ram_end) & (page_size - 1)) ||
+        !mcc_t6032_or_range((u64)first << 12, ((u64)last + 1) << 12, ram_base,
+                            &start, &end) ||
+        start < ram_base || end > ram_end || ((start | end) & (page_size - 1)))
+        return false;
+    out->base = start;
+    out->size = end - start;
+    return true;
+}
+
+int mcc_unmap_carveouts_t6032(u64 alias_size)
+{
+    const u64 aliases[] = {0, REGION_RWX_EL0, REGION_RW_EL0, REGION_RX_EL1};
+    struct mcc_carveout staged[PLANE_TZ_MAX_REGS + 1] = {0};
+    u64 starts[PLANE_TZ_MAX_REGS * 4], ends[PLANE_TZ_MAX_REGS * 4];
+    unsigned count = 0, target_count = 0;
+    u64 page_size = get_page_size();
+    /* Both raw and Mach-O loaders must place the loaded payload below the heap. */
+    u64 image_start = (u64)_base, payload_start = (u64)_payload_start;
+    u64 image_end = cur_boot_args.top_of_kernel_data;
+    u64 kernel_start = cur_boot_args.phys_base;
+    u64 heap_start = cur_boot_args.top_of_kernel_data;
+    u64 heap_cursor = (u64)heapblock_get_cursor();
+    u64 old_limit = (u64)heapblock_get_limit();
+
+    mcc_carveout_count = 0;
+    memset(mcc_carveouts, 0, sizeof(mcc_carveouts));
+    if (chip_id != T6032 || !mcc_initialized || mcc_count != T6032_MCC_INSTANCE_COUNT ||
+        mcc_regs[0].tz != &t6031_tz_regs || t6031_tz_regs.count != PLANE_TZ_MAX_REGS ||
+        (page_size != 4096 && page_size != 16384) || !ram_base || !mem_size_actual ||
+        ram_base > (u64)-1 - mem_size_actual || !alias_size ||
+        alias_size > mem_size_actual || (alias_size & (page_size - 1)))
+        return -1;
+    u64 ram_end = ram_base + mem_size_actual;
+    if (((ram_base | ram_end) & (page_size - 1)) || image_start < ram_base ||
+        image_start >= payload_start || payload_start > image_end || image_end > ram_end ||
+        kernel_start < ram_base ||
+        kernel_start > heap_start || heap_start > heap_cursor || heap_cursor > ram_end ||
+        (old_limit && old_limit < heap_cursor))
+        return -1;
+    u64 heap_limit = old_limit && old_limit < ram_end ? old_limit : ram_end;
+
+    /* Same controller/plane/slots as the legacy path; this does not prove their layout. */
+    for (u32 i = 0; i < PLANE_TZ_MAX_REGS; i++) {
+        u64 off = (u64)t6031_tz_regs.stride * i;
+        u32 first = plane_read32(0, 0, t6031_tz_regs.start + off);
+        u32 last = plane_read32(0, 0, t6031_tz_regs.end + off);
+        bool enabled = plane_read32(0, 0, t6031_tz_regs.enable + off);
+        if (!enabled)
+            continue;
+        struct mcc_carveout candidate;
+        if (!mcc_t6032_decode_carveout(first, last, page_size, &candidate))
+            return -1;
+        u64 end = candidate.base + candidate.size;
+        for (unsigned j = 0; j < 4; j++) {
+            u64 mapped_size = j ? alias_size : mem_size_actual;
+            u64 mapped_end = ram_base + mapped_size;
+            if (candidate.base >= mapped_end)
+                continue;
+            u64 clipped_end = end < mapped_end ? end : mapped_end;
+            u64 start_va, end_va, alias_ram = ram_base | aliases[j];
+            if (!mcc_t6032_or_range(candidate.base, clipped_end, aliases[j], &start_va, &end_va) ||
+                alias_ram > (u64)-1 - mapped_size ||
+                start_va != alias_ram + (candidate.base - ram_base) ||
+                (start_va < image_end && image_start < end_va) ||
+                (start_va < heap_cursor && kernel_start < end_va) ||
+                mcc_t6032_overlap(start_va, end_va, starts, ends, target_count))
+                return -1;
+            starts[target_count] = start_va;
+            ends[target_count++] = end_va;
+        }
+        if (candidate.base >= heap_cursor && candidate.base < heap_limit)
+            heap_limit = candidate.base;
+        staged[count++] = candidate;
+    }
+
+    /* No mappings or allocator limits change until every slot and alias validates. */
+    heapblock_set_limit((void *)heap_limit);
+    for (unsigned i = 0; i < target_count; i++)
+        mmu_rm_mapping(starts[i], ends[i] - starts[i]);
+    memcpy(mcc_carveouts, staged, sizeof(staged));
+    mcc_carveout_count = count;
+    return 0;
+}
+
 int mcc_unmap_carveouts(void)
 {
+    if (chip_id == T6032)
+        return -1; /* T6032 requires the exact alias mapping size from memory.c. */
     if (!mcc_initialized)
         return -1;
 

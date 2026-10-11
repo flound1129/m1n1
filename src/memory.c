@@ -495,7 +495,8 @@ static void mmu_add_default_mappings(void)
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
     /* Unmap carveout regions */
-    mcc_unmap_carveouts();
+    if (chip_id != T6032)
+        mcc_unmap_carveouts();
 
     /*
      * Remap m1n1 executable code as RX.
@@ -540,6 +541,9 @@ static void mmu_add_default_mappings(void)
      */
     mmu_remap_ranges();
     mmu_remap_smp_shared();
+    /* T6032: validate and remove carveouts after all default mappings, before MMU enable. */
+    if (chip_id == T6032 && mcc_unmap_carveouts_t6032(ram_size) < 0)
+        panic("T6032 carveout validation failed!\n");
 }
 
 static void mmu_configure(void)
