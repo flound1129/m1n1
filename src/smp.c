@@ -293,7 +293,7 @@ static bool smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
 
-    if (index >= MAX_CPUS)
+    if (index < 0 || index >= MAX_CPUS)
         return false;
 
     if (has_el3() && index >= MAX_EL3_CPUS)
@@ -364,7 +364,7 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 {
     int i;
 
-    if (index >= MAX_CPUS)
+    if (index < 0 || index >= MAX_CPUS)
         return;
 
     if (!spin_table[index].flag)
@@ -648,7 +648,7 @@ void smp_stop_secondaries(bool deep_sleep)
 
 void smp_send_ipi(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return;
 
     u64 mpidr = spin_table[cpu].mpidr;
@@ -661,7 +661,7 @@ void smp_send_ipi(int cpu)
 
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return;
 
     struct spin_table *target = &spin_table[cpu];
@@ -689,7 +689,7 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 
 u64 smp_wait(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return 0;
 
     struct spin_table *target = &spin_table[cpu];
@@ -714,7 +714,7 @@ void smp_set_wfe_mode(bool new_mode)
 
 bool smp_is_alive(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return false;
 
     return spin_table[cpu].flag;
@@ -722,7 +722,7 @@ bool smp_is_alive(int cpu)
 
 uint64_t smp_get_mpidr(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return 0;
 
     return spin_table[cpu].mpidr;
@@ -730,10 +730,10 @@ uint64_t smp_get_mpidr(int cpu)
 
 u64 smp_get_release_addr(int cpu)
 {
-    struct spin_table *target = &spin_table[cpu];
-
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return 0;
+
+    struct spin_table *target = &spin_table[cpu];
 
     target->args[0] = 0;
     target->args[1] = 0;

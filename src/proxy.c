@@ -353,40 +353,54 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             smp_stop_secondaries(request->args[0]);
             break;
         case P_SMP_CALL:
-            smp_call4(request->args[0], (void *)request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], (void *)request->args[1], request->args[2],
                       request->args[3], request->args[4], request->args[5]);
             break;
         case P_SMP_CALL_SYNC:
-            smp_call4(request->args[0], (void *)request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], (void *)request->args[1], request->args[2],
                       request->args[3], request->args[4], request->args[5]);
-            reply->retval = smp_wait(request->args[0]);
+            reply->retval = smp_wait((int)request->args[0]);
             break;
         case P_SMP_WAIT:
-            reply->retval = smp_wait(request->args[0]);
+            if (request->args[0] < MAX_CPUS)
+                reply->retval = smp_wait((int)request->args[0]);
             break;
         case P_SMP_SET_WFE_MODE:
             smp_set_wfe_mode(request->args[0]);
             break;
         case P_SMP_IS_ALIVE:
-            reply->retval = smp_is_alive(request->args[0]);
+            if (request->args[0] < MAX_CPUS)
+                reply->retval = smp_is_alive((int)request->args[0]);
             break;
         case P_SMP_CALL_EL1:
-            smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], el1_call, request->args[1], request->args[2],
                       request->args[3], request->args[4]);
             break;
         case P_SMP_CALL_EL1_SYNC:
-            smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], el1_call, request->args[1], request->args[2],
                       request->args[3], request->args[4]);
-            reply->retval = smp_wait(request->args[0]);
+            reply->retval = smp_wait((int)request->args[0]);
             break;
         case P_SMP_CALL_EL0:
-            smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], el0_call, request->args[1], request->args[2],
                       request->args[3], request->args[4]);
             break;
         case P_SMP_CALL_EL0_SYNC:
-            smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            smp_call4((int)request->args[0], el0_call, request->args[1], request->args[2],
                       request->args[3], request->args[4]);
-            reply->retval = smp_wait(request->args[0]);
+            reply->retval = smp_wait((int)request->args[0]);
             break;
 
         case P_HEAPBLOCK_ALLOC:
