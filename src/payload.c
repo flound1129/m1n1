@@ -3,6 +3,7 @@
 #include "../build/build_cfg.h"
 #include "../build/build_tag.h"
 
+#include <stdint.h>
 #include "payload.h"
 #include "adt.h"
 #include "assert.h"
@@ -18,6 +19,7 @@
 #include "libfdt/libfdt.h"
 #include "minilzlib/minlzma.h"
 #include "tinf/tinf.h"
+#include "xnuboot.h"
 
 // Kernels must be 2MB aligned
 #define KERNEL_ALIGN (2 << 20)
@@ -46,6 +48,49 @@ static char *chainload_spec = NULL;
 
 static void *load_one_payload(void *start, size_t size);
 
+#define MAX_DECOMPRESSED_SIZE (1U << 30)
+
+/*
+ * Align the cursor without reserving a speculative one-GiB destination. The
+ * actual zero-byte allocator call remains below so heapblock keeps ownership
+ * of the cursor and finalize_uncompression() can reserve the true length.
+ */
+static bool prepare_decompression_buffer(void **dest, uint32_t *dest_len)
+{
+    uintptr_t cursor = (uintptr_t)heapblock_get_cursor();
+    if (!cursor || cursor > UINTPTR_MAX - (KERNEL_ALIGN - 1))
+        return false;
+
+    uintptr_t aligned = (cursor + KERNEL_ALIGN - 1) & ~(KERNEL_ALIGN - 1);
+    uintptr_t limit;
+    void *heap_limit = heapblock_get_limit();
+
+    if (heap_limit) {
+        /* A published carveout/RAM limit is authoritative. */
+        limit = (uintptr_t)heap_limit;
+    } else {
+        u64 ram_end;
+        if (aligned < cur_boot_args.phys_base ||
+            __builtin_add_overflow(cur_boot_args.phys_base, cur_boot_args.mem_size, &ram_end) ||
+            ram_end > UINTPTR_MAX)
+            return false;
+        limit = (uintptr_t)ram_end;
+    }
+
+    if (aligned >= limit)
+        return false;
+
+    /* Keep the existing allocator's alignment/ownership transition. */
+    *dest = heapblock_alloc_aligned(0, KERNEL_ALIGN);
+    if ((uintptr_t)*dest != aligned)
+        return false;
+
+    u64 available = (u64)limit - aligned;
+    *dest_len = (uint32_t)(available < MAX_DECOMPRESSED_SIZE ? available :
+                           MAX_DECOMPRESSED_SIZE);
+    return *dest_len != 0;
+}
+
 static void finalize_uncompression(void *dest, size_t dest_len)
 {
     // Actually reserve the space. malloc is safe after this, but...
@@ -65,11 +110,13 @@ static void finalize_uncompression(void *dest, size_t dest_len)
 
 static void *decompress_gz(void *p, size_t size)
 {
-    unsigned int source_len = size, dest_len = 1 << 30; // 1 GiB should be enough hopefully
+    unsigned int source_len = size, dest_len;
 
     // Start at the end of the heap area, no allocation yet. The following code must not use
     // malloc or heapblock, until finalize_uncompression is called.
-    void *dest = heapblock_alloc_aligned(0, KERNEL_ALIGN);
+    void *dest;
+    if (!prepare_decompression_buffer(&dest, &dest_len))
+        return NULL;
 
     printf("Uncompressing... ");
     int ret = tinf_gzip_uncompress(dest, &dest_len, p, &source_len);
@@ -88,11 +135,13 @@ static void *decompress_gz(void *p, size_t size)
 
 static void *decompress_xz(void *p, size_t size)
 {
-    uint32_t source_len = size, dest_len = 1 << 30; // 1 GiB should be enough hopefully
+    uint32_t source_len = size, dest_len;
 
     // Start at the end of the heap area, no allocation yet. The following code must not use
     // malloc or heapblock, until finalize_uncompression is called.
-    void *dest = heapblock_alloc_aligned(0, KERNEL_ALIGN);
+    void *dest;
+    if (!prepare_decompression_buffer(&dest, &dest_len))
+        return NULL;
 
     printf("Uncompressing... ");
     int ret = XzDecode(p, &source_len, dest, &dest_len);
