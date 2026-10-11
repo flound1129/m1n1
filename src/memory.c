@@ -647,6 +647,9 @@ static void mmu_secondary_setup(void)
 
 void mmu_init_secondary(int cpu)
 {
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+
     smp_call4(cpu, mmu_secondary_setup, 0, 0, 0, 0);
     smp_wait(cpu);
 }

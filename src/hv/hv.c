@@ -339,6 +339,9 @@ static void hv_enter_secondary(void *entry, u64 regs[4])
 
 void hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+
     printf("HV: Initializing secondary %d\n", cpu);
     iodev_console_flush();
 
@@ -360,6 +363,9 @@ void hv_exit_cpu(int cpu)
 {
     if (cpu == -1)
         cpu = smp_id();
+
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
 
     printf("HV: Requesting exit of CPU#%d from the guest\n", cpu);
     hv_should_exit[cpu] = true;
@@ -402,6 +408,9 @@ bool hv_switch_cpu(int cpu)
 
 void hv_pin_cpu(int cpu)
 {
+    if (cpu < -1 || cpu >= MAX_CPUS)
+        return;
+
     hv_pinned_cpu = cpu;
 }
 

@@ -319,7 +319,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             mmu_restore(request->args[0]);
             break;
         case P_MMU_INIT_SECONDARY:
-            mmu_init_secondary(request->args[0]);
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            mmu_init_secondary((int)request->args[0]);
             break;
 
         case P_XZDEC: {
@@ -537,25 +539,43 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                          request->args[3]);
             break;
         case P_HV_WDT_START:
-            hv_wdt_start(request->args[0]);
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            hv_wdt_start((int)request->args[0]);
             break;
         case P_HV_START_SECONDARY:
-            hv_start_secondary(request->args[0], (void *)request->args[1], &request->args[2]);
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            hv_start_secondary((int)request->args[0], (void *)request->args[1], &request->args[2]);
             break;
         case P_HV_SWITCH_CPU:
-            reply->retval = hv_switch_cpu(request->args[0]);
+            if (request->args[0] >= MAX_CPUS)
+                break;
+            reply->retval = hv_switch_cpu((int)request->args[0]);
             break;
         case P_HV_SET_TIME_STEALING:
             hv_set_time_stealing(request->args[0], request->args[1]);
             break;
         case P_HV_PIN_CPU:
-            hv_pin_cpu(request->args[0]);
+            {
+                u64 raw_cpu = request->args[0];
+                if (raw_cpu >= MAX_CPUS && raw_cpu != (u64)-1)
+                    break;
+                int cpu = raw_cpu == (u64)-1 ? -1 : (int)raw_cpu;
+                hv_pin_cpu(cpu);
+            }
             break;
         case P_HV_WRITE_HCR:
             hv_write_hcr(request->args[0]);
             break;
         case P_HV_EXIT_CPU:
-            hv_exit_cpu(request->args[0]);
+            {
+                u64 raw_cpu = request->args[0];
+                if (raw_cpu >= MAX_CPUS && raw_cpu != (u64)-1)
+                    break;
+                int cpu = raw_cpu == (u64)-1 ? -1 : (int)raw_cpu;
+                hv_exit_cpu(cpu);
+            }
             break;
         case P_HV_ADD_TIME:
             hv_add_time(request->args[0]);

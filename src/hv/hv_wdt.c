@@ -149,6 +149,9 @@ void hv_wdt_init(void)
 
 void hv_wdt_start(int cpu)
 {
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+
     if (hv_wdt_active)
         return;
 
