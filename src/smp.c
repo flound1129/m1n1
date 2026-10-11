@@ -204,7 +204,8 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
     }
 
     if (i >= 100)
-        printf("Failed!\n");
+        /* A late CPU can still consume target_cpu and the shared reset stacks. */
+        panic("SMP: CPU %d start timed out; refusing to reuse reset state\n", index);
     else
         printf("  Started.\n");
 
