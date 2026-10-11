@@ -314,7 +314,9 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
-        cpufreq_init();
+        int cpufreq_status = cpufreq_init();
+        if (chip_id == T6032 && cpufreq_status < 0)
+            return -1;
         if (smp_start_secondaries() < 0)
             return -1;
         mitigations_perform();
