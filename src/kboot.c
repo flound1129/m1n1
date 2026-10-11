@@ -765,6 +765,7 @@ static int dt_set_cpus(void)
     if ((cluster_node < 0) && (cluster_node != -FDT_ERR_NOTFOUND))
         bail_cleanup("FDT: Error iterating through CPU clusters\n");
 
+    free(pruned_phandles);
     return 0;
 
 err:
