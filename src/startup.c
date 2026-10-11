@@ -158,6 +158,26 @@ void dump_boot_args(struct boot_args *ba)
     }
 }
 
+/* Arithmetic checks only: the handoff still owns the ADT mapping/lifetime contract. */
+static bool adt_boot_address(const struct boot_args *ba, u64 *address)
+{
+    u64 virtual_address = (u64)ba->devtree;
+    u64 physical_address, virtual_end, physical_end;
+
+    if (ba->devtree_size < sizeof(struct adt_node_hdr) || virtual_address < ba->virt_base)
+        return false;
+    if (__builtin_add_overflow(virtual_address, (u64)ba->devtree_size, &virtual_end) ||
+        __builtin_add_overflow(ba->phys_base, virtual_address - ba->virt_base,
+                               &physical_address) ||
+        __builtin_add_overflow(physical_address, (u64)ba->devtree_size, &physical_end))
+        return false;
+    if (!physical_address || (physical_address & 3))
+        return false;
+
+    *address = physical_address;
+    return true;
+}
+
 extern void get_device_info(void);
 void _start_c(void *boot_args, void *base)
 {
@@ -168,8 +188,15 @@ void _start_c(void *boot_args, void *base)
     boot_args_addr = (u64)boot_args;
     memcpy(&cur_boot_args, boot_args, sizeof(cur_boot_args));
 
-    adt =
-        (void *)(((u64)cur_boot_args.devtree) - cur_boot_args.virt_base + cur_boot_args.phys_base);
+    u64 adt_address;
+    if (!adt_boot_address(&cur_boot_args, &adt_address)) {
+        /* UART/ADT-dependent reporting is not available this early. */
+        debug_putc('D');
+        debug_putc('!');
+        while (1)
+            ;
+    }
+    adt = (void *)adt_address;
 
 #ifndef BRINGUP
     int node = adt_path_offset(adt, "/cpus");
