@@ -93,6 +93,12 @@ void smp_secondary_entry(void)
         }
     }
 
+    if (index < 0 || index >= MAX_CPUS)
+        panic("SMP: invalid reset-entry index %d\n", index);
+    if (chip_id == T6032 && smp_reset_stacks[index].mpidr != ~0ULL &&
+        smp_reset_stacks[index].mpidr != mpidr)
+        panic("SMP: unknown MPIDR 0x%lx would overwrite CPU %d reset state\n", mpidr, index);
+
     smp_reset_stacks[index].stack = (u64)secondary_stacks[index] + SECONDARY_STACK_SIZE;
     smp_reset_stacks[index].mpidr = mpidr;
     sysop("dsb sy");
@@ -405,6 +411,9 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     }
 
     if (i >= 50) {
+        /* Do not let a later start accept the old flag after an unconfirmed stop. */
+        if (chip_id == T6032)
+            panic("SMP: CPU %d stop timed out; refusing to reuse live state\n", index);
         printf("Failed!\n");
     } else {
         printf("  Stopped.\n");
