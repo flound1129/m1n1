@@ -154,7 +154,12 @@ void m1n1_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    mcc_init();
+    if (chip_id == T6032) {
+        if (mcc_init() < 0)
+            panic("T6032 MCC initialization failed!\n");
+    } else {
+        mcc_init();
+    }
     mmu_init();
     aic_init();
     smp_init();

@@ -2937,7 +2937,9 @@ int kboot_prepare_dt(void *fdt)
 
 int kboot_boot(void *kernel)
 {
-    mcc_enable_cache();
+    int mcc_ret = mcc_enable_cache();
+    if (chip_id == T6032 && mcc_ret < 0)
+        return -1;
     tunables_apply_static();
     clk_init();
 

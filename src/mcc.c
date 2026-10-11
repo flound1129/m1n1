@@ -153,6 +153,146 @@ struct mcc_regs {
 static int mcc_count;
 static struct mcc_regs mcc_regs[MAX_MCC_INSTANCES];
 
+#define T6032_MCC_HEADER_COUNT 4
+#define T6032_MCC_ENTRY_COUNT  20
+#define T6032_MCC_INSTANCE_COUNT 16
+#define T6032_MCC_REG_OFFSET  4
+
+#if MAX_MCC_INSTANCES < T6032_MCC_INSTANCE_COUNT
+#error "MAX_MCC_INSTANCES is too small for T6032"
+#endif
+
+static bool mcc_t6032_u32_prop(int node, const char *name, u32 *value)
+{
+    u32 length = 0;
+    const u8 *raw = adt_getprop(adt, node, name, &length);
+    if (!raw || length != 4)
+        return false;
+    *value = (u32)raw[0] | ((u32)raw[1] << 8) | ((u32)raw[2] << 16) |
+             ((u32)raw[3] << 24);
+    return true;
+}
+
+static u64 mcc_t6032_u64(const u8 *raw)
+{
+    u64 value = 0;
+    for (unsigned byte = 0; byte < 8; byte++)
+        value |= (u64)raw[byte] << (8 * byte);
+    return value;
+}
+
+static bool mcc_t6032_range(u64 base, u64 size, u64 *end)
+{
+    if (!base || !size || (base & 3) || base > (u64)-1 - size)
+        return false;
+    *end = base + size;
+    return true;
+}
+
+static bool mcc_t6032_overlap(u64 base, u64 end, const u64 *bases, const u64 *ends,
+                              unsigned count)
+{
+    for (unsigned i = 0; i < count; i++)
+        if (base < ends[i] && bases[i] < end)
+            return true;
+    return false;
+}
+
+static bool mcc_t6032_window_bounds(u64 base, u64 size, u32 plane_count, u32 dcs_count)
+{
+    u64 end, plane_end, tz_end, global_end, dcs_end;
+    if (!plane_count || !dcs_count || !t6031_tz_regs.count ||
+        !mcc_t6032_range(base, size, &end) ||
+        base > (u64)-1 - T6031_PLANE_OFFSET - (u64)(plane_count - 1) * T6031_PLANE_STRIDE ||
+        base + T6031_PLANE_OFFSET + (u64)(plane_count - 1) * T6031_PLANE_STRIDE >
+            (u64)-1 - PLANE_CACHE_STATUS - 4)
+        return false;
+    plane_end = base + T6031_PLANE_OFFSET + (u64)(plane_count - 1) * T6031_PLANE_STRIDE +
+                PLANE_CACHE_STATUS + 4;
+    if (base > (u64)-1 - T6031_PLANE_OFFSET - t6031_tz_regs.enable -
+                    (u64)(t6031_tz_regs.count - 1) * t6031_tz_regs.stride - 4)
+        return false;
+    tz_end = base + T6031_PLANE_OFFSET + t6031_tz_regs.enable +
+             (u64)(t6031_tz_regs.count - 1) * t6031_tz_regs.stride + 4;
+    if (base > (u64)-1 - T6031_GLOBAL_OFFSET - 4)
+        return false;
+    global_end = base + T6031_GLOBAL_OFFSET + 4;
+    if (base > (u64)-1 - T6031_DCS_OFFSET -
+                    (u64)(dcs_count - 1) * T6031_DCS_STRIDE - 4)
+        return false;
+    dcs_end = base + T6031_DCS_OFFSET + (u64)(dcs_count - 1) * T6031_DCS_STRIDE + 4;
+    return plane_end <= end && tz_end <= end && global_end <= end && dcs_end <= end;
+}
+
+static void mcc_t6032_invalidate(void)
+{
+    mcc_initialized = false;
+    mcc_count = 0;
+    memset(mcc_regs, 0, sizeof(mcc_regs));
+}
+
+static int mcc_init_t6032(int node, int *path)
+{
+    static const u64 header_sizes[T6032_MCC_HEADER_COUNT] = {0x20000, 0x149c, 0x4000, 0x4000};
+    struct mcc_regs staged[MAX_MCC_INSTANCES] = {0};
+    u64 raw_bases[T6032_MCC_ENTRY_COUNT], raw_ends[T6032_MCC_ENTRY_COUNT];
+    u64 bases[MAX_MCC_INSTANCES], ends[MAX_MCC_INSTANCES];
+    u32 reg_len = 0, plane_count = 0, dcs_count = 0;
+    const u8 *raw;
+
+    mcc_t6032_invalidate();
+    if (!adt_is_compatible(adt, node, "mcc,t6031"))
+        return -1;
+    raw = adt_getprop(adt, node, "reg", &reg_len);
+    if (!raw || reg_len != T6032_MCC_ENTRY_COUNT * 16 ||
+        !mcc_t6032_u32_prop(node, "plane-count-per-amcc", &plane_count) ||
+        !mcc_t6032_u32_prop(node, "dcs-count-per-amcc", &dcs_count) || plane_count != 4 ||
+        dcs_count != 4)
+        return -1;
+
+    for (unsigned i = 0; i < T6032_MCC_ENTRY_COUNT; i++) {
+        u64 base = mcc_t6032_u64(raw + i * 16);
+        u64 size = mcc_t6032_u64(raw + i * 16 + 8);
+        u64 end;
+        u64 expected = i < T6032_MCC_HEADER_COUNT ? header_sizes[i] : 0x2000000;
+        if (size != expected || !mcc_t6032_range(base, size, &end) ||
+            mcc_t6032_overlap(base, end, raw_bases, raw_ends, i))
+            return -1;
+        raw_bases[i] = base;
+        raw_ends[i] = end;
+    }
+
+    for (unsigned i = 0; i < T6032_MCC_INSTANCE_COUNT; i++) {
+        u64 base, size, end;
+        if (adt_get_reg(adt, path, "reg", i + T6032_MCC_REG_OFFSET, &base, &size) < 0 ||
+            size != 0x2000000 || !mcc_t6032_window_bounds(base, size, plane_count, dcs_count) ||
+            !mcc_t6032_range(base, size, &end) ||
+            mcc_t6032_overlap(base, end, bases, ends, i))
+            return -1;
+        bases[i] = base;
+        ends[i] = end;
+
+        staged[i].plane_base = base + T6031_PLANE_OFFSET;
+        staged[i].plane_stride = T6031_PLANE_STRIDE;
+        staged[i].plane_count = plane_count;
+        staged[i].global_base = base + T6031_GLOBAL_OFFSET;
+        staged[i].dcs_base = base + T6031_DCS_OFFSET;
+        staged[i].dcs_stride = T6031_DCS_STRIDE;
+        staged[i].dcs_count = dcs_count;
+        staged[i].cache_enable_val = 1;
+        staged[i].cache_ways = T6031_CACHE_WAYS;
+        staged[i].cache_status_mask = T6031_CACHE_STATUS_MASK;
+        staged[i].cache_status_val = T6031_CACHE_STATUS_VAL;
+        staged[i].cache_disable = 0;
+        staged[i].tz = &t6031_tz_regs;
+    }
+
+    memcpy(mcc_regs, staged, sizeof(staged));
+    mcc_count = T6032_MCC_INSTANCE_COUNT;
+    mcc_initialized = true;
+    return 0;
+}
+
 static u32 plane_read32(int mcc, int plane, u64 offset)
 {
     return read32(mcc_regs[mcc].plane_base + plane * mcc_regs[mcc].plane_stride + offset);
@@ -510,12 +650,17 @@ int mcc_init_m4(int node, int *path)
 int mcc_init(void)
 {
     int path[8];
+    if (chip_id == T6032)
+        mcc_t6032_invalidate();
     int node = adt_path_offset_trace(adt, "/arm-io/mcc", path);
 
     if (node < 0) {
         printf("MCC: MCC node not found!\n");
         return -1;
     }
+
+    if (chip_id == T6032)
+        return mcc_init_t6032(node, path);
 
     if (adt_is_compatible(adt, node, "mcc,t8103")) {
         return mcc_init_t8103(node, path, false);
