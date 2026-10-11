@@ -390,14 +390,17 @@ static bool mcc_t6032_or_range(u64 start, u64 end, u64 mask, u64 *mapped_start, 
 static bool mcc_t6032_decode_carveout(u32 first, u32 last, u64 page_size,
                                       struct mcc_carveout *out)
 {
-    u64 start, end;
+    /* TZ page indices use a fixed origin, independently of mapped RAM.
+     * Reject unknown high bits; do not reinterpret them as address bits. */
+    const u64 tz_origin = 0x10000000000ULL;
     if ((page_size != 4096 && page_size != 16384) || !first || last <= first ||
+        first > 0x0fffffffU || last > 0x0fffffffU ||
         !ram_base || !mem_size_actual || ram_base > (u64)-1 - mem_size_actual)
         return false;
+    u64 start = tz_origin + ((u64)first << 12);
+    u64 end = tz_origin + (((u64)last + 1) << 12);
     u64 ram_end = ram_base + mem_size_actual;
     if (((ram_base | ram_end) & (page_size - 1)) ||
-        !mcc_t6032_or_range((u64)first << 12, ((u64)last + 1) << 12, ram_base,
-                            &start, &end) ||
         start < ram_base || end > ram_end || ((start | end) & (page_size - 1)))
         return false;
     out->base = start;
