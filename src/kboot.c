@@ -587,7 +587,7 @@ static int dt_set_cpus(void)
         if (strncmp(name, "cpu@", 4))
             goto next_node;
 
-        if (cpu > MAX_CPUS)
+        if (cpu >= MAX_CPUS)
             bail_cleanup("Maximum number of CPUs exceeded, consider increasing MAX_CPUS\n");
 
         const fdt64_t *prop = fdt_getprop(dt, node, "reg", NULL);

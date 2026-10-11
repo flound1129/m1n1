@@ -388,7 +388,7 @@ void hv_rendezvous(void)
 
 bool hv_switch_cpu(int cpu)
 {
-    if (cpu > MAX_CPUS || cpu < 0 || !hv_started_cpus[cpu]) {
+    if (cpu >= MAX_CPUS || cpu < 0 || !hv_started_cpus[cpu]) {
         printf("HV: CPU #%d is inactive or invalid\n", cpu);
         return false;
     }
