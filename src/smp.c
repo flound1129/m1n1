@@ -149,6 +149,55 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
+static bool smp_cpu_start_masks(int die, int cluster, int core, u32 *system_mask,
+                                u32 *cluster_mask)
+{
+    if (chip_id != T6032) {
+        *system_mask = 1 << (4 * cluster + core);
+        *cluster_mask = 1 << core;
+        return true;
+    }
+
+    if (die < 0 || die >= 2 || cluster < 0 || cluster >= 3 || core < 0)
+        return false;
+
+    int node = adt_path_offset(adt, "/arm-io/pmgr");
+    if (node < 0)
+        return false;
+
+    u32 length = 0;
+    const u8 *mode = adt_getprop(adt, node, "acc-harvesting", &length);
+    if (!mode || length != 4 || mode[0] != 1 || mode[1] || mode[2] || mode[3])
+        return false;
+
+    const u8 *clusters = adt_getprop(adt, node, "clusters", &length);
+    if (!clusters || length != 12)
+        return false;
+
+    static const u32 widths[3] = {4, 6, 6};
+    static const u32 shifts[3] = {0, 4, 10};
+    u32 selected_width = 0, selected_shift = 0;
+    for (int i = 0; i < 3; i++) {
+        const u8 *record = clusters + 4 * i;
+        u32 width = (u32)record[0] | ((u32)record[1] << 8);
+        u32 shift = (u32)record[2] | ((u32)record[3] << 8);
+        /* Only this observed layout is qualified; reject every other one. */
+        if (width != widths[i] || shift != shifts[i])
+            return false;
+        if (i == cluster) {
+            selected_width = width;
+            selected_shift = shift;
+        }
+    }
+
+    if ((u32)core >= selected_width)
+        return false;
+
+    *system_mask = 1U << (selected_shift + (u32)core);
+    *cluster_mask = 1U << (u32)core;
+    return true;
+}
+
 static void smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
@@ -161,6 +210,12 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     if (spin_table[index].flag)
         return;
+
+    u32 system_mask, cluster_mask;
+    if (!smp_cpu_start_masks(cpu->die, cpu->cluster, cpu->core, &system_mask, &cluster_mask)) {
+        printf("Unsupported T6032 CPU-start metadata or topology!\n");
+        return;
+    }
 
     if (!cpu_features->apple_sysregs_unlocked &&
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
@@ -191,10 +246,10 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
-    write32(start_base + 0x4, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x4, system_mask);
 
     // Actually start the core
-    write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
+    write32(start_base + 0x8 + 4 * cpu->cluster, cluster_mask);
 
     for (i = 0; i < 100; i++) {
         sysop("dmb ld");
@@ -223,12 +278,18 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     if (!spin_table[index].flag)
         return;
 
+    u32 system_mask, cluster_mask;
+    if (!smp_cpu_start_masks(cpu->die, cpu->cluster, cpu->core, &system_mask, &cluster_mask)) {
+        printf("Unsupported T6032 CPU-stop metadata or topology!\n");
+        return;
+    }
+
     printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
 
     u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
 
     // Request CPU stop
-    write32(start_base + 0x0, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x0, system_mask);
 
     u64 dsleep = deep_sleep;
     // Put the CPU to sleep
