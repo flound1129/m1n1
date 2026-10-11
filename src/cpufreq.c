@@ -78,6 +78,15 @@ static u32 pstate_reg_to_pstate(u64 val)
 
 static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
 {
+    /* Complete inherited transitions before sampling or changing the request. */
+    if (chip_id == T6032 &&
+        poll64(cluster->base + CLUSTER_PSTATE, CLUSTER_PSTATE_BUSY, 0,
+               CLUSTER_SWITCH_TIMEOUT) < 0) {
+        printf("cpufreq: Timed out waiting for cluster %s inherited P-State switch\n",
+               cluster->name);
+        return -1;
+    }
+
     u64 val = read64(cluster->base + CLUSTER_PSTATE);
 
     if (pstate_reg_to_pstate(val) != pstate) {
