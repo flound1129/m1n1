@@ -441,14 +441,33 @@ int mcc_unmap_carveouts_t6032(u64 alias_size)
         kernel_start > heap_start || heap_start > heap_cursor || heap_cursor > ram_end ||
         (old_limit && old_limit < heap_cursor))
         return -1;
+    /* Check every descriptor before the first register access. */
+    for (int controller = 0; controller < T6032_MCC_INSTANCE_COUNT; controller++) {
+        if (mcc_regs[controller].tz != &t6031_tz_regs ||
+            mcc_regs[controller].plane_count != 4 ||
+            mcc_regs[controller].plane_stride != T6031_PLANE_STRIDE)
+            return -1;
+    }
     u64 heap_limit = old_limit && old_limit < ram_end ? old_limit : ram_end;
 
-    /* Same controller/plane/slots as the legacy path; this does not prove their layout. */
+    /* Require a common sampled map; this does not establish access safety or stability. */
     for (u32 i = 0; i < PLANE_TZ_MAX_REGS; i++) {
         u64 off = (u64)t6031_tz_regs.stride * i;
         u32 first = plane_read32(0, 0, t6031_tz_regs.start + off);
         u32 last = plane_read32(0, 0, t6031_tz_regs.end + off);
         bool enabled = plane_read32(0, 0, t6031_tz_regs.enable + off);
+        for (int controller = 0; controller < T6032_MCC_INSTANCE_COUNT; controller++) {
+            for (int plane = 0; plane < 4; plane++) {
+                if (!controller && !plane)
+                    continue;
+                u32 other_first = plane_read32(controller, plane, t6031_tz_regs.start + off);
+                u32 other_last = plane_read32(controller, plane, t6031_tz_regs.end + off);
+                bool other_enabled = plane_read32(controller, plane, t6031_tz_regs.enable + off);
+                if (other_enabled != enabled ||
+                    (enabled && (other_first != first || other_last != last)))
+                    return -1;
+            }
+        }
         if (!enabled)
             continue;
         struct mcc_carveout candidate;
