@@ -965,6 +965,13 @@ pub unsafe extern "C" fn adt_getprop_copy(
         Err(e) => return e as c_int,
     };
 
+    if p.size as usize != len {
+        return AdtError::BadLength as c_int;
+    }
+    if len == 0 {
+        return 0;
+    }
+
     match p.copy_raw(out as usize) {
         Ok(l) => {
             if l != len {
