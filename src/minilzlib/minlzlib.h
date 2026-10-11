@@ -37,6 +37,7 @@ Environment:
 //
 bool BfRead(uint8_t* Byte);
 bool BfSeek(uint32_t Length, uint8_t** Bytes);
+bool BfRewind(uint32_t Length);
 uint32_t BfTell(void);
 bool BfAlign(void);
 void BfInitialize(uint8_t* InputBuffer, uint32_t InputSize);
@@ -61,7 +62,7 @@ uint8_t RcGetBitTree(uint16_t* BitModel, uint16_t Limit);
 uint8_t RcGetReverseBitTree(uint16_t* BitModel, uint8_t HighestBit);
 uint8_t RcDecodeMatchedBitTree(uint16_t* BitModel, uint8_t MatchByte);
 uint32_t RcGetFixed(uint8_t HighestBit);
-bool RcInitialize(uint16_t* ChunkSize);
+bool RcInitialize(uint32_t* ChunkSize);
 uint8_t RcIsBitSet(uint16_t* Probability);
 void RcNormalize(void);
 bool RcCanRead(void);

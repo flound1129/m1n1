@@ -74,26 +74,34 @@ typedef struct _RANGE_DECODER_STATE
     //
     uint32_t Range;
     uint32_t Code;
+    bool Failed;
 } RANGE_DECODER_STATE, *PRANGE_DECODER_STATE;
 RANGE_DECODER_STATE RcState;
 
 bool
 RcInitialize (
-    uint16_t* ChunkSize
+    uint32_t* ChunkSize
     )
 {
     uint8_t i, rcByte;
     uint8_t* chunkEnd;
 
+    RcState.Failed = false;
+
     //
     // Make sure that the input buffer has enough space for the requirements of
     // the range encoder. We (temporarily) seek forward to validate this.
     //
-    if (!BfSeek(*ChunkSize, &chunkEnd))
+    if ((ChunkSize == NULL) || (*ChunkSize < LZMA_RC_INIT_BYTES))
     {
+        RcState.Failed = true;
         return false;
     }
-    BfSeek(-*ChunkSize, &chunkEnd);
+    if (!BfSeek(*ChunkSize, &chunkEnd) || !BfRewind(*ChunkSize))
+    {
+        RcState.Failed = true;
+        return false;
+    }
 
     //
     // The initial probability range is set to its highest value, after which
@@ -105,7 +113,11 @@ RcInitialize (
     RcState.Code = 0;
     for (i = 0; i < LZMA_RC_INIT_BYTES; i++)
     {
-        BfRead(&rcByte);
+        if (!BfRead(&rcByte))
+        {
+            RcState.Failed = true;
+            return false;
+        }
         RcState.Code = (RcState.Code << 8) | rcByte;
     }
 
@@ -116,9 +128,13 @@ RcInitialize (
     // become 0 exactly when the compressed chunk size has been fully consumed
     // by the decoder.
     //
-    BfSeek(0, &RcState.Start);
-    RcState.Limit = RcState.Start + *ChunkSize;
+    if (!BfSeek(0, &RcState.Start))
+    {
+        RcState.Failed = true;
+        return false;
+    }
     *ChunkSize -= LZMA_RC_INIT_BYTES;
+    RcState.Limit = RcState.Start + *ChunkSize;
     return true;
 }
 
@@ -132,8 +148,7 @@ RcCanRead (
     // We can keep reading symbols as long as we haven't reached the end of the
     // input buffer yet.
     //
-    BfSeek(0, &pos);
-    return pos <= RcState.Limit;
+    return !RcState.Failed && BfSeek(0, &pos) && (pos <= RcState.Limit);
 }
 
 bool
@@ -147,7 +162,10 @@ RcIsComplete (
     // there is nothing left to describe. Return the offset in the buffer where
     // this occurred (which should be equal to the compressed size).
     //
-    BfSeek(0, &pos);
+    if (RcState.Failed || (BytesProcessed == NULL) || !BfSeek(0, &pos))
+    {
+        return false;
+    }
     *BytesProcessed = (uint32_t)(pos - RcState.Start);
     return (RcState.Code == 0);
 }
@@ -165,11 +183,15 @@ RcNormalize (
     // two options appear identical with the number of precision bits that we
     // have. In this case, shift the state by a byte (8 bits) and read another.
     //
-    if (RcState.Range < LZMA_RC_MIN_RANGE)
+    if (!RcState.Failed && (RcState.Range < LZMA_RC_MIN_RANGE))
     {
         RcState.Range <<= 8;
         RcState.Code <<= 8;
-        BfRead(&rcByte);
+        if (!BfRead(&rcByte))
+        {
+            RcState.Failed = true;
+            return;
+        }
         RcState.Code |= rcByte;
     }
 }

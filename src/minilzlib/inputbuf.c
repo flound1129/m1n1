@@ -66,7 +66,9 @@ BfSetSoftLimit (
     uint32_t Remaining
     )
 {
-    if ((In.Size - In.Offset) < Remaining)
+    if ((In.Offset > In.SoftLimit) ||
+        (In.SoftLimit > In.Size) ||
+        (Remaining > (In.Size - In.Offset)))
     {
         return false;
     }
@@ -92,13 +94,35 @@ BfSeek (
     // Make sure the input buffer has enough space to seek the desired size, if
     // it does, return the current position and then seek past the desired size
     //
-    if ((In.Offset + Length) > In.SoftLimit)
+    if (Bytes != NULL)
     {
-        *Bytes = 0;
+        *Bytes = NULL;
+    }
+    if ((Bytes == NULL) ||
+        (In.Buffer == NULL) ||
+        (In.Offset > In.SoftLimit) ||
+        (In.SoftLimit > In.Size) ||
+        (Length > (In.SoftLimit - In.Offset)))
+    {
         return false;
     }
     *Bytes = &In.Buffer[In.Offset];
     In.Offset += Length;
+    return true;
+}
+
+bool
+BfRewind (
+    uint32_t Length
+    )
+{
+    if ((In.Offset > In.SoftLimit) ||
+        (In.SoftLimit > In.Size) ||
+        (Length > In.Offset))
+    {
+        return false;
+    }
+    In.Offset -= Length;
     return true;
 }
 
@@ -116,6 +140,10 @@ BfRead (
     )
 {
     uint8_t* pByte;
+    if (Byte == NULL)
+    {
+        return false;
+    }
     //
     // Seek past the byte and read it
     //

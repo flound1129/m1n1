@@ -137,7 +137,10 @@ XzDecodeIndex (
     //
     // Remember where the index started so we can compute its size
     //
-    BfSeek(0, &indexStart);
+    if (!BfSeek(0, &indexStart))
+    {
+        return false;
+    }
 
     //
     // The index always starts out with an empty byte
@@ -182,7 +185,10 @@ XzDecodeIndex (
     //
     // Store the index size with padding to validate the footer later
     //
-    BfSeek(0, &indexEnd);
+    if (!BfSeek(0, &indexEnd))
+    {
+        return false;
+    }
     Container.IndexSize = (uint32_t)(indexEnd - indexStart);
 
     //
@@ -277,14 +283,20 @@ XzDecodeBlock (
     // sizes and compare them against the footer and index after decoding.
     //
 #ifdef MINLZ_META_CHECKS
-    BfSeek(0, &inputStart);
+    if (!BfSeek(0, &inputStart))
+    {
+        return false;
+    }
 #endif
     if (!Lz2DecodeStream(BlockSize, OutputBuffer == NULL))
     {
         return false;
     }
 #ifdef MINLZ_META_CHECKS
-    BfSeek(0, &inputEnd);
+    if (!BfSeek(0, &inputEnd))
+    {
+        return false;
+    }
     Container.UnpaddedBlockSize = Container.HeaderSize +
                                    (uint32_t)(inputEnd - inputStart);
     Container.UncompressedBlockSize = *BlockSize;
@@ -404,8 +416,10 @@ XzDecodeBlockHeader (
         //
         // That's no block! That's an index!
         //
-        BfSeek((uint32_t)(-(uint16_t)sizeof(*blockHeader)),
-               (uint8_t**)&blockHeader);
+        if (!BfRewind(sizeof(*blockHeader)))
+        {
+            return XzBlockHeaderFail;
+        }
         return XzBlockHeaderNoBlock;
     }
 #ifdef MINLZ_META_CHECKS

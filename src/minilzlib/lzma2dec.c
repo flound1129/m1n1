@@ -31,7 +31,7 @@ bool
 Lz2DecodeChunk (
     uint32_t* BytesProcessed,
     uint32_t RawSize,
-    uint16_t CompressedSize
+    uint32_t CompressedSize
     )
 {
     uint32_t bytesProcessed;
@@ -76,7 +76,7 @@ Lz2DecodeStream (
     LZMA2_CONTROL_BYTE controlByte;
     uint8_t propertyByte;
     uint32_t rawSize;
-    uint16_t compressedSize;
+    uint32_t compressedSize;
 
     //
     // Read the first control byte
@@ -108,7 +108,7 @@ Lz2DecodeStream (
         if (controlByte.u.Common.IsLzma == 1)
         {
             rawSize = controlByte.u.Lzma.RawSize << 16;
-            compressedSize = inBytes[2] << 8;
+            compressedSize = (uint32_t)inBytes[2] << 8;
             compressedSize += inBytes[3] + 1;
         }
         else
@@ -160,9 +160,12 @@ Lz2DecodeStream (
         //
         if (GetSizeOnly)
         {
+            if (!BfSeek((controlByte.u.Common.IsLzma == 1) ? compressedSize : rawSize,
+                        &inBytes))
+            {
+                return false;
+            }
             *BytesProcessed += rawSize;
-            BfSeek((controlByte.u.Common.IsLzma == 1) ? compressedSize : rawSize,
-                   &inBytes);
             continue;
         }
         else if (controlByte.u.Common.IsLzma == 0)
