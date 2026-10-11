@@ -17,6 +17,8 @@ pub enum AdtError {
 const ADT_ALIGN: usize = 4;
 const ADT_MAX_DEPTH: usize = 8;
 const ADT_SIZE_MASK: u32 = 0x7fff_ffff;
+const ADT_NODE_HEADER_SIZE: usize = size_of::<ADTNode>();
+const ADT_PROPERTY_HEADER_SIZE: usize = size_of::<[c_char; 32]>() + size_of::<u32>();
 
 /// An ADT node consists of a header (the part described by the struct), packed
 /// key:value properties, and subnodes. Properties are always before subnodes
@@ -151,11 +153,80 @@ pub struct ADTSegmentRanges {
 
 /// Check that our address is properly aligned
 fn check_ptr(ptr: usize) -> Result<(), AdtError> {
-    if ptr % ADT_ALIGN != 0 {
+    if ptr == 0 || ptr % ADT_ALIGN != 0 {
         Err(AdtError::BadOffset)
     } else {
         Ok(())
     }
+}
+
+/// Return a byte range in the one boot-time ADT extent.  In particular, do
+/// not form the pointer until both the offset and length have been checked:
+/// callers pass offsets from C and a negative offset must never become a huge
+/// `usize` for `add`.
+fn adt_range(offset: usize, len: usize) -> Result<*mut u8, AdtError> {
+    let base = unsafe { adt as *mut u8 };
+    check_ptr(base as usize)?;
+    let extent = unsafe { adt_get_size() as usize };
+    if extent > isize::MAX as usize || offset > extent || len > extent - offset {
+        return Err(AdtError::BadOffset);
+    }
+    let end = (base as usize)
+        .checked_add(extent)
+        .ok_or(AdtError::BadOffset)?;
+    if end < base as usize {
+        return Err(AdtError::BadOffset);
+    }
+    // `offset <= extent <= isize::MAX` makes this add representable as a
+    // pointer offset; the checked address sum above rules out wrapping.
+    let ptr = unsafe { base.add(offset) };
+    check_ptr(ptr as usize)?;
+    Ok(ptr)
+}
+
+fn adt_offset_from_ptr(ptr: *const u8) -> Result<usize, AdtError> {
+    check_ptr(ptr as usize)?;
+    let base = unsafe { adt as *const u8 } as usize;
+    let addr = ptr as usize;
+    let offset = addr.checked_sub(base).ok_or(AdtError::BadOffset)?;
+    let _ = adt_range(offset, 0)?;
+    Ok(offset)
+}
+
+fn adt_offset_from_c(offset: c_int) -> Result<usize, AdtError> {
+    if offset < 0 {
+        return Err(AdtError::BadOffset);
+    }
+    Ok(offset as usize)
+}
+
+fn adt_offset_to_c(ptr: *const u8) -> Result<c_int, AdtError> {
+    let offset = adt_offset_from_ptr(ptr)?;
+    offset.try_into().map_err(|_| AdtError::BadOffset)
+}
+
+fn checked_record_len(payload: usize) -> Result<usize, AdtError> {
+    let padded = payload
+        .checked_add(ADT_ALIGN - 1)
+        .ok_or(AdtError::BadLength)?
+        & !(ADT_ALIGN - 1);
+    ADT_PROPERTY_HEADER_SIZE
+        .checked_add(padded)
+        .ok_or(AdtError::BadLength)
+}
+
+fn property_record(offset: usize) -> Result<(usize, usize), AdtError> {
+    let ptr = adt_range(offset, ADT_PROPERTY_HEADER_SIZE)?;
+    let raw_size = unsafe { u32::from_le(core::ptr::read_unaligned(ptr.add(32).cast::<u32>())) };
+    // Preserve the existing wire policy: payloads are below 1 MiB, while
+    // bit 31 is a template marker and is excluded from the payload length.
+    if raw_size & 0x7ff0_0000 != 0 {
+        return Err(AdtError::BadOffset);
+    }
+    let payload = (raw_size & ADT_SIZE_MASK) as usize;
+    let record_len = checked_record_len(payload)?;
+    let _ = adt_range(offset, record_len)?;
+    Ok((payload, record_len))
 }
 
 /// Determine if an ADT node's name is equal to some string bounded by a length.
@@ -205,7 +276,10 @@ pub fn get_reg_container(
     pname: &str,
     i: i32,
 ) -> Result<(u64, u64), AdtError> {
-    let head = unsafe { ADTNode::from_ptr(adt as *const ADTNode)? };
+    if nodes.is_empty() || i < 0 {
+        return Err(AdtError::BadPath);
+    }
+    let head = ADTNode::root()?;
 
     // Sanity check to make sure we have at least one node in the path
     if nodes[0].is_none() {
@@ -218,8 +292,12 @@ pub fn get_reg_container(
 
     let mut cursor: usize = nodes.len() - 1;
 
-    while nodes[cursor].is_none() {
+    while cursor > 0 && nodes[cursor].is_none() {
         cursor -= 1;
+    }
+
+    if nodes[cursor].is_none() {
+        return Err(AdtError::BadPath);
     }
 
     let mut node = nodes[cursor].unwrap();
@@ -248,7 +326,15 @@ pub fn get_reg_container(
 
     // Check that the reg property is big enough to contain a reg
     // container at index i.
-    if reg.payload_size() < (i as u32 + 1) * (addr_cells + size_cells) * 4 {
+    let cells = (addr_cells as usize)
+        .checked_add(size_cells as usize)
+        .ok_or(AdtError::BadValue)?;
+    let required = (i as usize)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(cells))
+        .and_then(|n| n.checked_mul(size_of::<u32>()))
+        .ok_or(AdtError::BadValue)?;
+    if (reg.payload_size() as usize) < required {
         return Err(AdtError::BadValue);
     }
 
@@ -257,16 +343,15 @@ pub fn get_reg_container(
 
     // SAFETY: For a reg property, this pointer arithmetic is always true,
     // as we check above that i is within bounds.
-    unsafe {
-        let aref_ptr: *const u32 =
-            (reg.value.as_ptr() as *const u32).add((i as u32 * (addr_cells + size_cells)) as usize);
-
-        let sref_ptr = aref_ptr.add((addr_cells) as usize);
-
-        addr_elems = core::slice::from_raw_parts(aref_ptr, addr_cells as usize);
-
-        size_elems = core::slice::from_raw_parts(sref_ptr, size_cells as usize);
-    }
+    let start = (i as usize).checked_mul(cells).ok_or(AdtError::BadValue)?;
+    let words: &[u32] = unsafe {
+        core::slice::from_raw_parts(
+            reg.value.as_ptr() as *const u32,
+            reg.value.len() / size_of::<u32>(),
+        )
+    };
+    addr_elems = &words[start..start + addr_cells as usize];
+    size_elems = &words[start + addr_cells as usize..start + cells];
 
     let mut addr = get_cells(addr_elems);
     let size = get_cells(size_elems);
@@ -294,8 +379,19 @@ pub fn get_reg_container(
             return Err(AdtError::BadNCells);
         }
 
-        let entry_size = (4 * (paddr_cells + addr_cells + size_cells)) as usize;
-        let slice = unsafe { core::slice::from_raw_parts(ranges.value.as_ptr(), ranges.payload_size() as _) };
+        let entry_words = (paddr_cells as usize)
+            .checked_add(addr_cells as usize)
+            .and_then(|n| n.checked_add(size_cells as usize))
+            .ok_or(AdtError::BadValue)?;
+        let entry_size = size_of::<u32>()
+            .checked_mul(entry_words)
+            .ok_or(AdtError::BadValue)?;
+        // An empty ranges property is the valid identity-mapping form.  A
+        // nonempty property must contain at least one complete entry.
+        if entry_size == 0 || (!ranges.value.is_empty() && ranges.value.len() < entry_size) {
+            return Err(AdtError::BadValue);
+        }
+        let slice: &[u8] = &ranges.value[..];
 
         for range in slice.chunks_exact(entry_size) {
             let (ca_ref, remainder) = range.split_at(4 * addr_cells as usize);
@@ -305,8 +401,15 @@ pub fn get_reg_container(
             let parent_addr = get_cells_u8(pa_ref);
             let child_size = get_cells_u8(cs_ref);
 
-            if addr >= child_addr && (addr + size) <= (child_addr + child_size) {
-                addr = addr - child_addr + parent_addr;
+            let addr_end = addr.checked_add(size).ok_or(AdtError::BadValue)?;
+            let child_end = child_addr
+                .checked_add(child_size)
+                .ok_or(AdtError::BadValue)?;
+            if addr >= child_addr && addr_end <= child_end {
+                addr = addr
+                    .checked_sub(child_addr)
+                    .and_then(|v| v.checked_add(parent_addr))
+                    .ok_or(AdtError::BadValue)?;
                 break;
             }
         }
@@ -322,40 +425,21 @@ pub fn get_reg_container(
 impl ADTNode {
     /// Check that the node pointed to is within the bounds of the ADT and
     /// has a valid property and child count
-    fn check(ptr: *const ADTNode) -> Result<(), AdtError> {
-        unsafe {
-            if ptr as usize + size_of::<ADTNode>() > adt.add(adt_get_size() as usize) as usize
-                || (*ptr).property_count > 2048
-                || (*ptr).property_count == 0
-                || (*ptr).child_count > 2048
-            {
-                Err(AdtError::BadOffset)
-            } else {
-                Ok(())
-            }
+    fn from_offset(offset: usize) -> Result<&'static ADTNode, AdtError> {
+        let ptr = adt_range(offset, ADT_NODE_HEADER_SIZE)? as *const ADTNode;
+        let property_count = unsafe { u32::from_le(core::ptr::read_unaligned(ptr.cast())) };
+        let child_count =
+            unsafe { u32::from_le(core::ptr::read_unaligned(ptr.cast::<u8>().add(4).cast())) };
+        if property_count > 2048 || property_count == 0 || child_count > 2048 {
+            return Err(AdtError::BadOffset);
         }
-    }
-
-    /// Returns a static reference to the ADTNode at the given address
-    fn from_ptr(ptr: *const ADTNode) -> Result<&'static ADTNode, AdtError> {
-        check_ptr(ptr as usize)?;
-
-        // SAFETY: The Rust API will only ever use this function to get the
-        // head of the ADT, which is given to us by iBoot and assumed valid.
-        // We use check_ptr() above to sanity-check any relocated offsets
-        // given to us by C code as best we can.
-        unsafe {
-            match ADTNode::check(ptr) {
-                Ok(()) => Ok(&*ptr),
-                Err(e) => Err(e),
-            }
-        }
+        // The header has been range-checked before constructing the reference.
+        Ok(unsafe { &*ptr })
     }
 
     /// Get a reference to the root node
     pub fn root() -> Result<&'static ADTNode, AdtError> {
-        let ptr: *const ADTNode = unsafe { adt as *const ADTNode };
-        ADTNode::from_ptr(ptr)
+        ADTNode::from_offset(0)
     }
 
     /// Get a reference to a node at a specified path, tracing the path to the
@@ -425,12 +509,20 @@ impl ADTNode {
         // SAFETY: We can never have a node that does not have at least one
         // property, and that property is always at the byte immediately following
         // the node header.
-        unsafe { ADTProperty::from_ptr(self.as_ptr().add(size_of::<ADTNode>()) as usize) }
+        let node_offset = adt_offset_from_ptr(self.as_ptr())?;
+        let property_offset = node_offset
+            .checked_add(ADT_NODE_HEADER_SIZE)
+            .ok_or(AdtError::BadOffset)?;
+        ADTProperty::from_offset(property_offset)
     }
 
     pub fn first_property_mut(&self) -> Result<&'static mut ADTProperty, AdtError> {
         // SAFETY: We know we are a valid node, and our header never changes size
-        unsafe { ADTProperty::from_ptr_mut(self.as_ptr().add(size_of::<ADTNode>()) as usize) }
+        let node_offset = adt_offset_from_ptr(self.as_ptr())?;
+        let property_offset = node_offset
+            .checked_add(ADT_NODE_HEADER_SIZE)
+            .ok_or(AdtError::BadOffset)?;
+        ADTProperty::from_offset_mut(property_offset)
     }
 
     pub fn properties(&self) -> ADTPropertiesIterator {
@@ -459,15 +551,12 @@ impl ADTNode {
         // SAFETY: We will only ever reach this code when we can guarantee that
         // p is a reference to the very last property of the node, meaning that
         // the next byte after it must be a node.
-        unsafe {
-            ADTNode::from_ptr(
-                p.as_ptr()
-                    .add(size_of::<[c_char; 32]>())
-                    .add(size_of::<u32>())
-                    .add((p.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
-                    as *const ADTNode,
-            )
-        }
+        let property_offset = adt_offset_from_ptr(p.as_ptr())?;
+        let (_, record_len) = property_record(property_offset)?;
+        let node_offset = property_offset
+            .checked_add(record_len)
+            .ok_or(AdtError::BadOffset)?;
+        ADTNode::from_offset(node_offset)
     }
 
     /// Walk the properties at the top of the curret node's memory to arrive at
@@ -559,66 +648,27 @@ impl ADTProperty {
     ///
     /// We need to do this manually since we do not know the size of
     /// ADTProperty.value beforehand.
-    fn fat_ptr(ptr: *const u8) -> *mut ADTProperty {
-        // SAFETY: This function is only ever called when we can guarantee that
-        // ptr points to a valid ADTProperty.
-        unsafe {
-            let size = (u32::from_le(core::ptr::read_unaligned(
-                ptr.add(32).cast::<u32>(),
-            )) & ADT_SIZE_MASK) as usize;
-            // A pointer to a struct with a slice tail carries the tail length,
-            // not the size of the header plus the tail. Bit 31 is a template
-            // marker in the ADT wire field and is excluded from the payload.
-            let sp: *const [u8] = core::ptr::slice_from_raw_parts(ptr, size);
-
-            sp as *mut ADTProperty
-        }
+    fn fat_ptr(ptr: *const u8, size: usize) -> *mut ADTProperty {
+        // A pointer to a struct with a slice tail carries the tail length, not
+        // the size of the header plus the tail.
+        let sp: *const [u8] = core::ptr::slice_from_raw_parts(ptr, size);
+        sp as *mut ADTProperty
     }
 
     /// Check that our property is no bigger than 1 MB
-    fn check(ptr: *const ADTProperty) -> Result<(), AdtError> {
-        if ptr.is_null() {
-            return Err(AdtError::BadOffset);
-        }
-
-        unsafe {
-            if (*ptr).size & 0x7ff00000 != 0 {
-                Err(AdtError::BadOffset)
-            } else {
-                Ok(())
-            }
-        }
+    /// Validate the complete physical record before constructing its DST.
+    fn from_offset(offset: usize) -> Result<&'static ADTProperty, AdtError> {
+        let (payload, _) = property_record(offset)?;
+        let ptr = adt_range(offset, ADT_PROPERTY_HEADER_SIZE)? as *const u8;
+        let prop = ADTProperty::fat_ptr(ptr, payload);
+        Ok(unsafe { &*prop })
     }
 
-    /// Returns a static reference to the ADTProperty at the given address
-    fn from_ptr(ptr: usize) -> Result<&'static ADTProperty, AdtError> {
-        check_ptr(ptr)?;
-
-        // SAFETY: By the time we reach this code, we can be certain that ptr
-        // points to an ADTProperty. This function is only used for FFI, and
-        // the pointer passed to it is a priori valid as we are simply recreating
-        // a pointer we would have calculated and passed to the foreign side
-        // as an offset relative to the ADT head.
-        unsafe {
-            let prop = ADTProperty::fat_ptr(ptr as *const u8);
-            match ADTProperty::check(prop) {
-                Ok(()) => Ok(&*prop),
-                Err(e) => Err(e),
-            }
-        }
-    }
-
-    fn from_ptr_mut(ptr: usize) -> Result<&'static mut ADTProperty, AdtError> {
-        check_ptr(ptr)?;
-
-        // SAFETY: Refer to the immutable function
-        unsafe {
-            let prop = ADTProperty::fat_ptr(ptr as *const u8);
-            match ADTProperty::check(prop) {
-                Ok(()) => Ok(&mut *prop),
-                Err(e) => Err(e),
-            }
-        }
+    fn from_offset_mut(offset: usize) -> Result<&'static mut ADTProperty, AdtError> {
+        let (payload, _) = property_record(offset)?;
+        let ptr = adt_range(offset, ADT_PROPERTY_HEADER_SIZE)? as *const u8;
+        let prop = ADTProperty::fat_ptr(ptr, payload);
+        Ok(unsafe { &mut *prop })
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -626,33 +676,24 @@ impl ADTProperty {
     }
 
     pub fn next_property(&self) -> Result<&'static ADTProperty, AdtError> {
-        // SAFETY: We know we are a valid property, and if the calculated pointer
-        // does not also point to one, ADTProperty::from_ptr() will catch it.
-        let ptr: usize = unsafe {
-            self.as_ptr()
-                .add(size_of::<[c_char; 32]>())
-                .add(size_of::<u32>())
-                .add((self.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
-        };
-        ADTProperty::from_ptr(ptr)
+        let offset = adt_offset_from_ptr(self.as_ptr())?;
+        let (_, record_len) = property_record(offset)?;
+        ADTProperty::from_offset(offset.checked_add(record_len).ok_or(AdtError::BadOffset)?)
     }
 
     pub fn next_property_mut(&self) -> Result<&'static mut ADTProperty, AdtError> {
-        // SAFETY: We know we are a valid property
-        let ptr: usize = unsafe {
-            self.as_ptr()
-                .add(32)
-                .add(4)
-                .add((self.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1)) as usize
-        };
-        ADTProperty::from_ptr_mut(ptr)
+        let offset = adt_offset_from_ptr(self.as_ptr())?;
+        let (_, record_len) = property_record(offset)?;
+        ADTProperty::from_offset_mut(offset.checked_add(record_len).ok_or(AdtError::BadOffset)?)
     }
 
     pub fn name(&self) -> &str {
-        CStr::from_bytes_until_nul(&self.name)
-            .unwrap()
-            .to_str()
-            .unwrap()
+        // The wire field is bytes; `c_char` is signed on several Rust
+        // targets, so view it explicitly as bytes before CStr parsing.
+        let name = unsafe {
+            core::slice::from_raw_parts(self.name.as_ptr() as *const u8, self.name.len())
+        };
+        CStr::from_bytes_until_nul(name).unwrap().to_str().unwrap()
     }
 
     pub fn str(&self) -> Result<&str, AdtError> {
@@ -667,7 +708,9 @@ impl ADTProperty {
 
     pub fn str_iter<'a>(&'a self) -> ADTPropertyStringIterator<'a> {
         ADTPropertyStringIterator {
-            value: unsafe { core::slice::from_raw_parts(self.value.as_ptr(), self.payload_size() as usize) },
+            value: unsafe {
+                core::slice::from_raw_parts(self.value.as_ptr(), self.payload_size() as usize)
+            },
         }
     }
 
@@ -678,11 +721,7 @@ impl ADTProperty {
         }
 
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                val.as_ptr(),
-                self.value.as_mut_ptr(),
-                size,
-            );
+            core::ptr::copy_nonoverlapping(val.as_ptr(), self.value.as_mut_ptr(), size);
         }
 
         Ok(size)
@@ -694,7 +733,11 @@ impl ADTProperty {
         // and we never reach this code if we aren't already certain that we are
         // a valid property
         unsafe {
-            core::ptr::copy_nonoverlapping(self.value.as_ptr(), ptr as *mut u8, self.payload_size() as usize);
+            core::ptr::copy_nonoverlapping(
+                self.value.as_ptr(),
+                ptr as *mut u8,
+                self.payload_size() as usize,
+            );
         }
 
         Ok(self.payload_size() as usize)
@@ -727,70 +770,81 @@ unsafe extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_check_header(_dt: *const c_void) -> c_int {
-    unsafe {
-        match ADTNode::from_ptr(adt as *const ADTNode) {
-            Ok(_) => 0,
-            Err(e) => e as c_int,
-        }
+    match ADTNode::root() {
+        Ok(_) => 0,
+        Err(e) => e as c_int,
     }
+}
+
+fn node_from_c_offset(offset: c_int) -> Result<&'static ADTNode, AdtError> {
+    ADTNode::from_offset(adt_offset_from_c(offset)?)
+}
+
+fn property_from_c_offset(offset: c_int) -> Result<&'static ADTProperty, AdtError> {
+    ADTProperty::from_offset(adt_offset_from_c(offset)?)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_first_property_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    let p: *const u8 = ADTNode::from_ptr(ptr)
-        .unwrap()
-        .first_property()
-        .unwrap()
-        .as_ptr();
-
-    unsafe { p.sub(adt as usize) as c_int }
+    match node_from_c_offset(offset).and_then(|n| n.first_property()) {
+        Ok(p) => adt_offset_to_c(p.as_ptr()).unwrap_or(AdtError::BadOffset as c_int),
+        Err(e) => e as c_int,
+    }
 }
 
-// This function has load-bearing UB on the C side... The sound Rust equivalent
-// breaks this. Recreate the UB here rather than call the new Rust function.
+// Preserve the C API's record-end behavior: this returns the checked end of
+// the current record even when it is the next node or one-past the ADT.
 #[no_mangle]
 pub unsafe extern "C" fn adt_next_property_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    let p = ADTProperty::from_ptr(ptr).unwrap();
-    unsafe {
-        p.as_ptr()
-            .add(size_of::<[c_char; 32]>())
-            .add(size_of::<u32>())
-            .add((p.payload_size() as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
-            .sub(adt as usize) as c_int
+    let offset = match adt_offset_from_c(offset) {
+        Ok(v) => v,
+        Err(e) => return e as c_int,
+    };
+    let (_, record_len) = match property_record(offset) {
+        Ok(v) => v,
+        Err(e) => return e as c_int,
+    };
+    let next = match offset.checked_add(record_len) {
+        Some(v) => v,
+        None => return AdtError::BadOffset as c_int,
+    };
+    match adt_range(next, 0) {
+        Ok(_) => next.try_into().unwrap_or(AdtError::BadOffset as c_int),
+        Err(e) => e as c_int,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_first_child_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    let n = ADTNode::from_ptr(ptr).unwrap();
-    let child = match n.first_child() {
+    let child = match node_from_c_offset(offset).and_then(|n| n.first_child()) {
         Ok(c) => c,
         Err(e) => return e as c_int,
     };
-    unsafe { child.as_ptr().sub(adt as usize) as c_int }
+    adt_offset_to_c(child.as_ptr()).unwrap_or(AdtError::BadOffset as c_int)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_next_sibling_offset(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    let n = ADTNode::from_ptr(ptr).unwrap();
-    unsafe { n.next_sibling().unwrap().as_ptr().sub(adt as usize) as c_int }
+    match node_from_c_offset(offset).and_then(|n| n.next_sibling()) {
+        Ok(n) => adt_offset_to_c(n.as_ptr()).unwrap_or(AdtError::BadOffset as c_int),
+        Err(e) => e as c_int,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_child_count(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().child_count as c_int
+    match node_from_c_offset(offset) {
+        Ok(n) => n.child_count as c_int,
+        Err(e) => e as c_int,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_property_count(_dt: *const c_void, offset: c_int) -> c_int {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().property_count as c_int
+    match node_from_c_offset(offset) {
+        Ok(n) => n.property_count as c_int,
+        Err(e) => e as c_int,
+    }
 }
 
 #[no_mangle]
@@ -798,8 +852,7 @@ pub unsafe extern "C" fn adt_get_property_by_offset(
     _dt: *const c_void,
     offset: c_int,
 ) -> *const c_void {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    match ADTProperty::from_ptr(ptr) {
+    match property_from_c_offset(offset) {
         Ok(p) => p as *const ADTProperty as *const c_void,
         Err(_) => core::ptr::null(),
     }
@@ -812,8 +865,10 @@ pub unsafe extern "C" fn adt_get_property(
     name: *const c_char,
 ) -> *const c_void {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    let n = ADTNode::from_ptr(ptr).unwrap();
+    let n = match node_from_c_offset(offset) {
+        Ok(n) => n,
+        Err(_) => return core::ptr::null(),
+    };
 
     match n.named_prop(strname) {
         Ok(p) => p.as_ptr() as *const c_void,
@@ -829,9 +884,11 @@ pub unsafe extern "C" fn adt_getprop(
     lenp: *mut c_uint,
 ) -> *const c_void {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    let p = match ADTNode::from_ptr(ptr).unwrap().named_prop(strname) {
+    let n = match node_from_c_offset(offset) {
+        Ok(n) => n,
+        Err(_) => return core::ptr::null(),
+    };
+    let p = match n.named_prop(strname) {
         Ok(prop) => prop,
         Err(_) => return core::ptr::null(),
     };
@@ -850,8 +907,7 @@ pub unsafe extern "C" fn adt_getprop_by_offset(
     namep: *mut *const c_char,
     lenp: *mut c_uint,
 ) -> *const c_void {
-    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
-    let p = match ADTProperty::from_ptr(ptr) {
+    let p = match property_from_c_offset(offset) {
         Ok(prop) => prop,
         Err(_) => return core::ptr::null(),
     };
@@ -875,19 +931,15 @@ pub unsafe extern "C" fn adt_setprop(
     val: *const c_void,
     len: *const c_size_t,
 ) -> c_int {
-    let buf: &[u8];
-    let strname: &str;
-    let ptr: *const ADTNode;
-    unsafe {
-        buf = core::slice::from_raw_parts(val as *const u8, len as usize);
-        strname = CStr::from_ptr(name).to_str().unwrap();
-        ptr = adt.add(offset as usize) as *const ADTNode;
-    };
-
-    let n = match ADTNode::from_ptr(ptr) {
+    let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
+    let n = match node_from_c_offset(offset) {
         Ok(node) => node,
         Err(e) => return e as c_int,
     };
+
+    // `val` and `len` are caller-owned C ABI inputs; ADT validation is done
+    // first so a bad node offset cannot be used to reach this slice.
+    let buf: &[u8] = unsafe { core::slice::from_raw_parts(val as *const u8, len as usize) };
 
     let p = match n.named_prop_mut(strname) {
         Ok(prop) => prop,
@@ -907,15 +959,13 @@ pub unsafe extern "C" fn adt_subnode_offset(
     name: *const c_char,
 ) -> c_int {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    let n = match ADTNode::from_ptr(ptr) {
+    let n = match node_from_c_offset(offset) {
         Ok(node) => node,
         Err(e) => return e as c_int,
     };
 
     match n.subnode_by_name(strname) {
-        Ok(s) => unsafe { s.as_ptr().sub(adt as usize) as c_int },
+        Ok(s) => adt_offset_to_c(s.as_ptr()).unwrap_or(AdtError::BadOffset as c_int),
         Err(e) => e as c_int,
     }
 }
@@ -927,11 +977,10 @@ pub unsafe extern "C" fn adt_is_compatible(
     compat: *const c_char,
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr)
-        .unwrap()
-        .is_compatible(strcompat)
-        .unwrap()
+    match node_from_c_offset(offset).and_then(|n| n.is_compatible(strcompat)) {
+        Ok(v) => v,
+        Err(_) => false,
+    }
 }
 
 #[no_mangle]
@@ -942,14 +991,18 @@ pub unsafe extern "C" fn adt_is_compatible_at(
     index: usize,
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().compatible(index).unwrap() == strcompat
+    match node_from_c_offset(offset) {
+        Ok(n) => n.compatible(index) == Some(strcompat),
+        Err(_) => false,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_name(_dt: *const c_void, offset: c_int) -> *const c_char {
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().name().unwrap().as_ptr() as *const c_char
+    match node_from_c_offset(offset).and_then(|n| n.name()) {
+        Ok(name) => name.as_ptr() as *const c_char,
+        Err(_) => core::ptr::null(),
+    }
 }
 
 #[no_mangle]
@@ -961,9 +1014,7 @@ pub unsafe extern "C" fn adt_getprop_copy(
     len: c_size_t,
 ) -> c_int {
     let strname: &str = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    let n = match ADTNode::from_ptr(ptr) {
+    let n = match node_from_c_offset(offset) {
         Ok(node) => node,
         Err(e) => return e as c_int,
     };
@@ -1006,11 +1057,20 @@ pub unsafe extern "C" fn adt_path_offset_trace(
 
     match ADTNode::from_path_trace(strpath, Some(&mut refs)) {
         Ok(n) => {
+            // The C callers provide eight-entry arrays and adt_get_reg
+            // requires a terminating zero.  Eight nonzero components would
+            // consume every slot and cannot be represented as a terminated
+            // path, so reject the result before writing any offsets.
+            if refs.iter().all(Option::is_some) {
+                return AdtError::BadPath as c_int;
+            }
             if !offsets.is_null() {
                 for (i, &r) in refs.iter().enumerate() {
                     unsafe {
                         let val = r
-                            .map(|r| r.as_ptr().sub(adt as usize) as i32)
+                            .map(|r| {
+                                adt_offset_to_c(r.as_ptr()).unwrap_or(AdtError::BadOffset as c_int)
+                            })
                             .unwrap_or_default();
                         *offsets.add(i) = val;
                         if val == 0 {
@@ -1019,7 +1079,7 @@ pub unsafe extern "C" fn adt_path_offset_trace(
                     }
                 }
             }
-            unsafe { n.as_ptr().sub(adt as usize) as c_int }
+            adt_offset_to_c(n.as_ptr()).unwrap_or(AdtError::BadOffset as c_int)
         }
         Err(e) => e as c_int,
     }
@@ -1030,7 +1090,7 @@ pub unsafe extern "C" fn adt_path_offset(_dt: *const c_void, path: *const c_char
     let strpath: &str = unsafe { CStr::from_ptr(path).to_str().unwrap() };
 
     match ADTNode::from_path(strpath) {
-        Ok(n) => unsafe { n.as_ptr().sub(adt as usize) as c_int },
+        Ok(n) => adt_offset_to_c(n.as_ptr()).unwrap_or(AdtError::BadOffset as c_int),
         Err(e) => e as c_int,
     }
 }
@@ -1045,24 +1105,30 @@ pub unsafe extern "C" fn adt_get_reg(
     psize: *mut u64,
 ) -> c_int {
     let strname: &str = unsafe { CStr::from_ptr(prop).to_str().unwrap() };
-    let o: &[i32];
     let mut n_offs: usize = 0;
     let mut refs: [Option<&'static ADTNode>; ADT_MAX_DEPTH] = [None; ADT_MAX_DEPTH];
 
     unsafe {
         // Unlike adt_path_offset_trace(), we need to know
         // the exact number of nodes in the path.
-        if *offsets == 0 {
+        if offsets.is_null() || *offsets == 0 {
             return AdtError::BadOffset as c_int;
         }
 
-        while *offsets.add(n_offs) != 0 {
+        while n_offs < ADT_MAX_DEPTH && *offsets.add(n_offs) != 0 {
             n_offs += 1;
         }
-
-        o = core::slice::from_raw_parts_mut(offsets, n_offs);
-        for (i, &offset) in o.iter().enumerate() {
-            refs[i] = Some(ADTNode::from_ptr(adt.add(offset as usize) as *const ADTNode).unwrap());
+        // A path without a sentinel is not a valid bounded path.  This also
+        // keeps the eight-entry refs array from being indexed out of bounds.
+        if n_offs == ADT_MAX_DEPTH {
+            return AdtError::BadPath as c_int;
+        }
+        for j in 0..n_offs {
+            let offset = *offsets.add(j);
+            refs[j] = match node_from_c_offset(offset) {
+                Ok(node) => Some(node),
+                Err(e) => return e as c_int,
+            };
         }
     }
 
