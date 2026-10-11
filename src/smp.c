@@ -166,6 +166,7 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
         printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
+        return;
     }
 
     printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
