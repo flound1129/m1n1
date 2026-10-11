@@ -531,7 +531,10 @@ int cpufreq_init(void)
 
     bool err = false;
     while (cluster->base) {
-        err |= cpufreq_init_cluster(cluster++, features);
+        int status = cpufreq_init_cluster(cluster++, features);
+        if (chip_id == T6032 && status < 0)
+            return status;
+        err |= status;
     }
 
     return err ? -1 : 0;
